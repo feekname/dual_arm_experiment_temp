@@ -1,0 +1,23 @@
+# 双臂GMO外力矩与触觉传感器标定对比实验 (v5: 含手自重补偿)
+# 时间: 2026-09-03 15:45:33
+# 左臂目标: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# 右臂目标: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# 手质量: 0.9kg
+# 列说明:
+#   1: time, 2: phase(0=move,1=hold)
+#   3-9: left_q, 10-16: right_q
+#   17-23: left_r_raw (GMO原始残差, Nm)
+#   24-30: right_r_raw
+#   31-37: left_r_comp (补偿手自重后残差, Nm)
+#   38-44: right_r_comp
+#   45-47: left_F_raw (GMO原始末端力, N)
+#   48-50: right_F_raw
+#   51-53: left_F_comp (补偿后末端力, N)
+#   54-56: right_F_comp
+#   57-59: left_F_hand (手自重末端力, N)
+#   60-62: right_F_hand
+#   63-67: left_nf1 (5指法向力), 68-72: right_nf1
+#   73-77: left_tangential(5指), 78-82: right_tangential
+#   83: left_n_sum, 84: right_n_sum, 85: left_t_sum, 86: right_t_sum
+#================================================================================
+# 记录总帧数: 0

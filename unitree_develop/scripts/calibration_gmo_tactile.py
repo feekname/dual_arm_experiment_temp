@@ -150,9 +150,13 @@ class TactileData:
 # GMO 广义动量观测器
 # ================================================================
 class GMOObserver:
-    def __init__(self, n_dof=7, gain=15.0):
+    def __init__(self, n_dof=7, gain=15.0, internal_gain=0.5):
         self.n_dof = n_dof
         self.K = gain * np.eye(n_dof)
+        # 积分项
+        self.Ki = internal_gain * np.eye(n_dof)  # 积分增益
+        self.integral = np.zeros(n_dof)            # 积分项
+
         self.P_hat = np.zeros(n_dof)
         self.r = np.zeros(n_dof)
         self.M_last = None
@@ -176,6 +180,13 @@ class GMOObserver:
         P_hat_dot = CTq + self.r + tau - G
         self.P_hat += P_hat_dot * dt
         self.r = self.K @ (P - self.P_hat)
+        # 比例残差
+        r_p = self.K @ (P - self.P_hat)
+        # 积分项（带抗饱和限幅）
+        self.integral += r_p * dt
+        self.integral = np.clip(self.integral, -20.0, 20.0)  # 抗饱和
+        # 最终残差 = 比例 + 积分
+        self.r = r_p + self.Ki @ self.integral
         return self.r.copy()
 
 
@@ -620,8 +631,8 @@ def main():
         while True:
             elapsed = time.time() - hold_start
             exp_time = time.time() - exp_start
-            if elapsed >= args.hold_time:
-                break
+            # if elapsed >= args.hold_time:
+            #     break
             server.manager.set_arm_poses(goal_l.tolist(), goal_r.tolist(),
                                            [0.0]*7, [0.0]*7)
             run_one_step(exp_time, 1)
