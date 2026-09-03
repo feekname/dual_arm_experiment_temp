@@ -83,15 +83,15 @@ class TactileData:
     def update(self, hand, nf1):
         with self._lock:
             if hand == "left":
-                self.left_nf1 = np.array(nf1, dtype=float)
+                self.left_nf1 = np.array(nf1, dtype=float)/1000
             else:
-                self.right_nf1 = np.array(nf1, dtype=float)
+                self.right_nf1 = np.array(nf1, dtype=float)/1000
     def get_sums(self):
         with self._lock:
-            return float(np.sum(self.left_nf1)), float(np.sum(self.right_nf1))
+            return float(np.sum(self.left_nf1)/1000), float(np.sum(self.right_nf1)/1000)
     def get_fingers(self):
         with self._lock:
-            return self.left_nf1.copy(), self.right_nf1.copy()
+            return self.left_nf1.copy()/1000, self.right_nf1.copy()/1000
 
 
 # ================================================================
@@ -436,17 +436,32 @@ def main():
 
         pb.update_states(cur_l_q, cur_r_q)
 
-        M_l, Cq_l, G_l = pb.compute_dynamics("left", cur_l_q, cur_l_dq)
-        r_l_raw = gmo_left.update(M_l, Cq_l, G_l, cur_l_tau, cur_l_dq, dt)
-        J_l = pb.compute_jacobian("left", cur_l_q, cur_l_dq)
-        r_l, _ = hand_comp_left.compensate(r_l_raw, J_l)
-        F_l = np.linalg.pinv(J_l.T) @ r_l
+        # 左臂 GMO + 手补偿
+        if phase == 0:
+            M_l, Cq_l, G_l = pb.compute_dynamics("left", cur_l_q, cur_l_dq)
+            r_l = gmo_left.update(M_l, Cq_l, G_l, cur_l_tau, cur_l_dq, dt)
+            J_l = pb.compute_jacobian("left", cur_l_q, cur_l_dq)
+            F_l = np.linalg.pinv(J_l.T) @ r_l
+        else:
+            M_l, Cq_l, G_l = pb.compute_dynamics("left", cur_l_q, cur_l_dq)
+            r_l = gmo_left.update(M_l, Cq_l, G_l, cur_l_tau, cur_l_dq, dt)
 
-        M_r, Cq_r, G_r = pb.compute_dynamics("right", cur_r_q, cur_r_dq)
-        r_r_raw = gmo_right.update(M_r, Cq_r, G_r, cur_r_tau, cur_r_dq, dt)
-        J_r = pb.compute_jacobian("right", cur_r_q, cur_r_dq)
-        r_r, _ = hand_comp_right.compensate(r_r_raw, J_r)
-        F_r = np.linalg.pinv(J_r.T) @ r_r
+            J_l = pb.compute_jacobian("left", cur_l_q, cur_l_dq)
+            r_l, _ = hand_comp_left.compensate(r_l, J_l)
+            F_l = np.linalg.pinv(J_l.T) @ r_l
+
+        # 右臂 GMO + 手补偿
+        if phase == 0:
+            M_r, Cq_r, G_r = pb.compute_dynamics("right", cur_r_q, cur_r_dq)
+            r_r = gmo_right.update(M_r, Cq_r, G_r, cur_r_tau, cur_r_dq, dt)
+            J_r = pb.compute_jacobian("right", cur_r_q, cur_r_dq)
+            F_r = np.linalg.pinv(J_r.T) @ r_r
+        else:
+            M_r, Cq_r, G_r = pb.compute_dynamics("right", cur_r_q, cur_r_dq)
+            r_r_raw = gmo_right.update(M_r, Cq_r, G_r, cur_r_tau, cur_r_dq, dt)
+            J_r = pb.compute_jacobian("right", cur_r_q, cur_r_dq)
+            r_r, _ = hand_comp_right.compensate(r_r_raw, J_r)
+            F_r = np.linalg.pinv(J_r.T) @ r_r
 
         t_left, t_right = tactile_data.get_sums()
         f_left_5, f_right_5 = tactile_data.get_fingers()
