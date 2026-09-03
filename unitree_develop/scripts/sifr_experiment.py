@@ -88,10 +88,10 @@ class TactileData:
                 self.right_nf1 = np.array(nf1, dtype=float)/1000
     def get_sums(self):
         with self._lock:
-            return float(np.sum(self.left_nf1)/1000), float(np.sum(self.right_nf1)/1000)
+            return float(np.sum(self.left_nf1)), float(np.sum(self.right_nf1))
     def get_fingers(self):
         with self._lock:
-            return self.left_nf1.copy()/1000, self.right_nf1.copy()/1000
+            return self.left_nf1.copy(), self.right_nf1.copy()
 
 
 # ================================================================
@@ -402,6 +402,14 @@ def main():
     gmo_right.reset()
     sifr.reset()
 
+    # GMO稳态偏置（GRASP阶段最后2秒采集，TEST阶段去除）
+    gmo_bias_F_l = np.zeros(3)
+    gmo_bias_F_r = np.zeros(3)
+    gmo_bias_samples_l = []
+    gmo_bias_samples_r = []
+    gmo_bias_applied = False
+    bias_collect_start = args.move_time + args.grasp_time - 2.0
+
     def get_phase(exp_time):
         if exp_time < args.move_time:
             return 0
@@ -412,6 +420,7 @@ def main():
 
     def run_one_step(exp_time, target_l, target_r):
         nonlocal last_time, last_print, record_count
+        nonlocal gmo_bias_F_l, gmo_bias_F_r, gmo_bias_samples_l, gmo_bias_samples_r, gmo_bias_applied
 
         now = time.time()
         dt = now - last_time
@@ -465,6 +474,20 @@ def main():
 
         t_left, t_right = tactile_data.get_sums()
         f_left_5, f_right_5 = tactile_data.get_fingers()
+        
+        # ===== GMO稳态偏置处理 =====
+        if phase == 1 and exp_time >= bias_collect_start:
+            gmo_bias_samples_l.append(F_l.copy())
+            gmo_bias_samples_r.append(F_r.copy())
+        elif phase == 2:
+            if not gmo_bias_applied and len(gmo_bias_samples_l) > 10:
+                gmo_bias_F_l = np.mean(gmo_bias_samples_l, axis=0)
+                gmo_bias_F_r = np.mean(gmo_bias_samples_r, axis=0)
+                gmo_bias_applied = True
+                print(f"\n[GMO] 稳态偏置已采集: L={gmo_bias_F_l}, R={gmo_bias_F_r}")
+            if gmo_bias_applied:
+                F_l = F_l - gmo_bias_F_l
+                F_r = F_r - gmo_bias_F_r
 
         gmo_force = (np.linalg.norm(F_l) + np.linalg.norm(F_r)) / 2.0
         F_E = np.sqrt(F_l[0]**2 + F_l[1]**2 + F_r[0]**2 + F_r[1]**2) / 2.0
