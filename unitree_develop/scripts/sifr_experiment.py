@@ -370,6 +370,16 @@ def main():
                         help='左手6电机目标位置, 覆盖--hand-pose')
     parser.add_argument('--hand-right-pos', type=int, nargs=6, default=None,
                         help='右手6电机目标位置, 覆盖--hand-pose')
+    # 固定接触力抓取参数
+    parser.add_argument('--hand-target-force', type=float, default=80.0,
+                        help='固定接触力抓取的目标触觉力(raw值), 达到后停止弯曲')
+    parser.add_argument('--hand-grasp-step', type=int, default=15,
+                        help='固定接触力抓取每步位置增量')
+    parser.add_argument('--hand-grasp-interval', type=float, default=0.3,
+                        help='固定接触力抓取每步间隔(秒)')
+    # 关节角增量限幅
+    parser.add_argument('--joint-delta-max', type=float, default=0.008,
+                        help='每帧关节角最大变化量(rad), @100Hz对应0.8rad/s')
     # SIFR参数（物理标定：1kg物体，μ=0.3 → F_fixed = m*g/(2*μ) ≈ 16.35N/臂）
     parser.add_argument('--F-fixed', type=float, default=16.35, help='固定期望内力 (N/臂), 默认16.35=1kg*9.81/(2*0.3)')
     parser.add_argument('--mu', type=float, default=0.3, help='摩擦系数(仅用于记录滑动和fc)')
@@ -397,7 +407,7 @@ def main():
     print(f"\n[数据] 记录文件: {output_path}")
 
     q_min = np.array([-2.0, -1.2, -2.5, -0.7, -1.6, -1.4, -1.2])
-    q_max = np.array([ 2.0,  2.0,  2.5,  1.8,  1.6,  1.4,  1.2])
+    q_max = np.array([ 2.0,  1.2,  2.5,  1.8,  1.6,  1.4,  1.2])
     dq_max = 0.2
 
     pb = DualArmPyBullet(args.urdf)
@@ -464,6 +474,10 @@ def main():
     gmo_right.reset()
     sifr.reset()
 
+    # 关节角增量限幅：记录上一帧目标位置
+    last_target_l = start_l.copy()
+    last_target_r = start_r.copy()
+
     # GMO稳态偏置（GRASP阶段最后2秒采集，TEST阶段去除）
     gmo_bias_F_l = np.zeros(3)
     gmo_bias_F_r = np.zeros(3)
@@ -483,6 +497,7 @@ def main():
     def run_one_step(exp_time, target_l, target_r):
         nonlocal last_time, last_print, record_count
         nonlocal gmo_bias_F_l, gmo_bias_F_r, gmo_bias_samples_l, gmo_bias_samples_r, gmo_bias_applied
+        nonlocal last_target_l, last_target_r
 
         now = time.time()
         dt = now - last_time
@@ -572,6 +587,16 @@ def main():
         target_l = check_joint_limits(target_l, q_min, q_max)
         target_r = check_joint_limits(target_r, q_min, q_max)
 
+        # ===== 关节角增量限幅（防止突变）=====
+        delta_l = target_l - last_target_l
+        delta_r = target_r - last_target_r
+        delta_l = np.clip(delta_l, -args.joint_delta_max, args.joint_delta_max)
+        delta_r = np.clip(delta_r, -args.joint_delta_max, args.joint_delta_max)
+        target_l = last_target_l + delta_l
+        target_r = last_target_r + delta_r
+        last_target_l = target_l.copy()
+        last_target_r = target_r.copy()
+
         if phase == 0:
             server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
                                         [0.0]*7, [0.0]*7)
@@ -605,6 +630,13 @@ def main():
 
     try:
         print(f"\n[阶段1] 运动到预备姿态 ({args.move_time}s)...")
+
+        # 灵巧手先完全张开，方便放置物体
+        if args.hand_enable:
+            cmd_queue.put(('both_release', 800))
+            print("[手控] 双手已张开，可放置物体")
+            time.sleep(1.0)
+
         move_start = time.time()
         while True:
             elapsed = time.time() - move_start
@@ -619,18 +651,50 @@ def main():
 
         print(f"\n[阶段2] 夹持物体，跟踪固定内力 F_fixed={args.F_fixed}N ({args.grasp_time}s)...")
 
-        # 灵巧手夹持控制
+        # ===== 固定接触力逐步抓取 =====
         if args.hand_enable:
-            if args.hand_left_pos is not None:
-                cmd_queue.put(('set_positions', 'left', args.hand_left_pos, args.hand_duration))
-            else:
-                cmd_queue.put(('grasp', 'left', args.hand_pose, args.hand_duration))
-            if args.hand_right_pos is not None:
-                cmd_queue.put(('set_positions', 'right', args.hand_right_pos, args.hand_duration))
-            else:
-                cmd_queue.put(('grasp', 'right', args.hand_pose, args.hand_duration))
-            print(f"[手控] 已发送夹持指令: pose={args.hand_pose}, duration={args.hand_duration}ms")
-            time.sleep(min(args.hand_duration / 1000.0 + 0.5, 2.0))
+            left_pos = [10, 50, 50, 50, 50, 50]
+            right_pos = [10, 50, 50, 50, 50, 50]
+            max_finger_pos = 600
+            target_force = args.hand_target_force
+            step = args.hand_grasp_step
+            interval = args.hand_grasp_interval
+
+            print(f"[手控] 固定接触力抓取: 目标力={target_force}raw, 步长={step}, 间隔={interval}s")
+
+            grasp_force_reached = False
+            grasp_force_start_time = time.time()
+            grasp_force_timeout = 8.0
+
+            while not grasp_force_reached:
+                f_l, f_r = tactile_data.get_fingers_raw()
+                left_force = float(np.sum(f_l))
+                right_force = float(np.sum(f_r))
+                avg_force = (left_force + right_force) / 2.0
+
+                print(f"\r  [手控] 逐步抓取: 左手力={left_force:.0f} 右手力={right_force:.0f} "
+                      f"平均={avg_force:.0f}/{target_force:.0f} "
+                      f"四指位置={left_pos[2]}", end="", flush=True)
+
+                if avg_force >= target_force:
+                    grasp_force_reached = True
+                    print(f"\n[手控] 达到目标接触力: {avg_force:.0f}raw, 四指位置={left_pos[2]}")
+                    break
+
+                if time.time() - grasp_force_start_time > grasp_force_timeout:
+                    print(f"\n[手控] 抓取超时({grasp_force_timeout}s), 当前力={avg_force:.0f}, 停止增加")
+                    break
+
+                for i in [2, 3, 4, 5]:
+                    left_pos[i] = min(max_finger_pos, left_pos[i] + step)
+                    right_pos[i] = min(max_finger_pos, right_pos[i] + step)
+
+                cmd_queue.put(('set_positions', 'left', left_pos.copy(), 200))
+                cmd_queue.put(('set_positions', 'right', right_pos.copy(), 200))
+                time.sleep(interval)
+
+            print(f"[手控] 抓取完成, 最终位置: L={left_pos}, R={right_pos}")
+            time.sleep(0.5)
 
         grasp_start = time.time()
         while True:
