@@ -570,7 +570,8 @@ def main():
 
         gmo_force = (np.linalg.norm(F_l) + np.linalg.norm(F_r)) / 2.0
         F_E = np.sqrt(F_l[0]**2 + F_l[1]**2 + F_r[0]**2 + F_r[1]**2) / 2.0
-        F_I_est = abs(t_left_N - t_right_N) * 0.5
+        # F_I_est = abs(t_left_N - t_right_N) * 0.5
+        F_I_est = max(t_left_N, t_right_N)
 
         # SIFR控制器（阶段2和阶段3生效）
         if phase >= 1:
@@ -653,9 +654,9 @@ def main():
 
         # ===== 固定接触力逐步抓取 =====
         if args.hand_enable:
-            left_pos = [10, 50, 50, 50, 50, 50]
-            right_pos = [10, 50, 50, 50, 50, 50]
-            max_finger_pos = 600
+            left_pos = [400, 400, 50, 50, 50, 50]
+            right_pos = [400, 400, 50, 50, 50, 50]
+            max_finger_pos = 400
             target_force = args.hand_target_force
             step = args.hand_grasp_step
             interval = args.hand_grasp_interval

@@ -686,7 +686,8 @@ def main():
         F_E = np.sqrt(F_l[0]**2 + F_l[1]**2 + F_r[0]**2 + F_r[1]**2) / 2.0
 
         # 实际内力估计（左右触觉力差的绝对值，单位N）
-        F_I_est = abs(t_left_N - t_right_N) * 0.5
+        # F_I_est = abs(t_left_N - t_right_N) * 0.5
+        F_I_est = max(t_left_N, t_right_N)
 
         # DIFR控制器（阶段2和阶段3生效）
         if phase >= 1:
@@ -779,10 +780,10 @@ def main():
         # ===== 固定接触力逐步抓取 =====
         if args.hand_enable:
             # 初始位置（张开）
-            left_pos = [10, 50, 50, 50, 50, 50]
-            right_pos = [10, 50, 50, 50, 50, 50]
+            left_pos = [400, 400, 50, 50, 50, 50]
+            right_pos = [400, 400, 50, 50, 50, 50]
             # 四指最大弯曲位置（拇指保持不动）
-            max_finger_pos = 600
+            max_finger_pos = 400
             target_force = args.hand_target_force
             step = args.hand_grasp_step
             interval = args.hand_grasp_interval
