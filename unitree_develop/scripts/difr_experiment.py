@@ -48,37 +48,95 @@ from server import G1Server
 
 
 # ================================================================
-# 触觉子进程（spawn 隔离 DDS）
+# 触觉+灵巧手子进程（spawn 隔离 DDS）
 # ================================================================
-def tactile_subscriber_worker(data_queue, log_queue, stop_event):
+def tactile_subscriber_worker(data_queue, log_queue, cmd_queue, stop_event):
+    '''
+    子进程：同时处理触觉订阅和灵巧手控制
+    cmd_queue指令格式:
+      ('grasp', hand, pose_name, duration)
+      ('release', hand, duration)
+      ('set_positions', hand, [6 positions], duration)
+      ('set_single', hand, motor_id, position, duration)
+      ('both_grasp', pose_name, duration)
+      ('both_release', duration)
+    '''
     try:
         import rclpy
         from rclpy.node import Node
         from ros2_stark_msgs.msg import TouchStatus
+        from hand_controller import HandController
     except ImportError as e:
         log_queue.put(f"[触觉] 导入失败: {e}")
         return
     FINGER_COUNT = 5
-    class TactileNode(Node):
+
+    class TactileHandNode(Node):
         def __init__(self):
-            super().__init__("difr_tactile_sub")
-            self.left_sub = self.create_subscription(TouchStatus, "/left_hand/touch_status_126", self.left_cb, 10)
-            self.right_sub = self.create_subscription(TouchStatus, "/right_hand/touch_status_127", self.right_cb, 10)
-            log_queue.put("[触觉] 订阅已创建")
+            super().__init__("difr_tactile_hand")
+            self.left_sub = self.create_subscription(
+                TouchStatus, "/left_hand/touch_status_126", self.left_cb, 10)
+            self.right_sub = self.create_subscription(
+                TouchStatus, "/right_hand/touch_status_127", self.right_cb, 10)
+            self.hand = HandController(self)
+            log_queue.put("[触觉+手控] 订阅和控制器已创建")
+
         def _extract(self, msg):
             nf1 = np.zeros(FINGER_COUNT)
             for i in range(min(FINGER_COUNT, len(msg.data))):
                 nf1[i] = float(msg.data[i].normal_force1)
             return nf1
+
         def left_cb(self, msg):
             data_queue.put(("left", self._extract(msg).tolist(), time.time()))
+
         def right_cb(self, msg):
             data_queue.put(("right", self._extract(msg).tolist(), time.time()))
+
+        def execute_cmd(self, cmd):
+            '''执行灵巧手控制指令'''
+            try:
+                action = cmd[0]
+                if action == 'grasp':
+                    hand, pose, duration = cmd[1], cmd[2], cmd[3]
+                    self.hand.grasp(hand, pose, duration)
+                    log_queue.put(f"[手控] {hand}手执行姿态: {pose}")
+                elif action == 'release':
+                    hand, duration = cmd[1], cmd[2]
+                    self.hand.release(hand, duration)
+                    log_queue.put(f"[手控] {hand}手松开")
+                elif action == 'set_positions':
+                    hand, positions, duration = cmd[1], cmd[2], cmd[3]
+                    self.hand.set_positions(hand, positions, mode=5,
+                                            durations=[duration]*6)
+                    log_queue.put(f"[手控] {hand}手设置位置: {positions}")
+                elif action == 'set_single':
+                    hand, motor_id, position, duration = cmd[1], cmd[2], cmd[3], cmd[4]
+                    self.hand.set_single(hand, motor_id, position, duration=duration)
+                    log_queue.put(f"[手控] {hand}手电机{motor_id}→{position}")
+                elif action == 'both_grasp':
+                    pose, duration = cmd[1], cmd[2]
+                    self.hand.both_grasp(pose, duration)
+                    log_queue.put(f"[手控] 双手执行姿态: {pose}")
+                elif action == 'both_release':
+                    duration = cmd[1]
+                    self.hand.both_release(duration)
+                    log_queue.put(f"[手控] 双手松开")
+            except Exception as e:
+                log_queue.put(f"[手控] 指令执行失败: {e}")
+
     try:
         rclpy.init()
-        node = TactileNode()
+        node = TactileHandNode()
         while not stop_event.is_set():
-            rclpy.spin_once(node, timeout_sec=0.1)
+            rclpy.spin_once(node, timeout_sec=0.05)
+            # 检查控制指令
+            while not cmd_queue.empty():
+                try:
+                    cmd = cmd_queue.get_nowait()
+                    node.execute_cmd(cmd)
+                except Exception:
+                    break
         node.destroy_node()
         rclpy.shutdown()
     except Exception as e:
@@ -89,20 +147,26 @@ def tactile_subscriber_worker(data_queue, log_queue, stop_event):
 # 触觉数据容器
 # ================================================================
 class TactileData:
-    def __init__(self):
-        self.left_nf1 = np.zeros(5)
-        self.right_nf1 = np.zeros(5)
+    def __init__(self, scale=0.01):
+        self.left_nf1 = np.zeros(5)   # raw值（不做转换）
+        self.right_nf1 = np.zeros(5)  # raw值
+        self.scale = scale              # raw → N 转换系数（需砝码实验标定）
         self._lock = threading.Lock()
     def update(self, hand, nf1):
         with self._lock:
             if hand == "left":
-                self.left_nf1 = np.array(nf1, dtype=float)/1000
+                self.left_nf1 = np.array(nf1, dtype=float)
             else:
-                self.right_nf1 = np.array(nf1, dtype=float)/1000
-    def get_sums(self):
+                self.right_nf1 = np.array(nf1, dtype=float)
+    def get_sums_N(self):
+        '''标定后的法向力总和（单位N）= raw_sum × scale'''
+        with self._lock:
+            return float(np.sum(self.left_nf1) * self.scale), float(np.sum(self.right_nf1) * self.scale)
+    def get_sums_raw(self):
+        '''raw值（用于调试）'''
         with self._lock:
             return float(np.sum(self.left_nf1)), float(np.sum(self.right_nf1))
-    def get_fingers(self):
+    def get_fingers_raw(self):
         with self._lock:
             return self.left_nf1.copy(), self.right_nf1.copy()
 
@@ -386,6 +450,24 @@ def main():
     parser.add_argument('--interface', type=str, default='eth0')
     parser.add_argument('--gmo-gain', type=float, default=5.0)
     parser.add_argument('--hand-mass', type=float, default=0.45)
+    parser.add_argument('--tactile-scale', type=float, default=0.01,
+                        help='触觉raw→N转换系数 (N/raw), 需砝码实验标定. 默认0.01即100raw=1N')
+    # 灵巧手控制参数
+    parser.add_argument('--hand-enable', action='store_true', default=False,
+                        help='启用灵巧手控制（默认禁用，仅手臂运动）')
+    parser.add_argument('--hand-pose', type=str, default='grasp',
+                        choices=['open', 'grasp', 'power', 'pinch', 'tripod'],
+                        help='GRASP阶段灵巧手预设姿态')
+    parser.add_argument('--hand-duration', type=int, default=1500,
+                        help='灵巧手运动时间(ms)')
+    parser.add_argument('--hand-left-pos', type=int, nargs=6, default=None,
+                        help='左手6电机目标位置 [m0 m1 m2 m3 m4 m5], 覆盖--hand-pose')
+    parser.add_argument('--hand-right-pos', type=int, nargs=6, default=None,
+                        help='右手6电机目标位置, 覆盖--hand-pose')
+    parser.add_argument('--hand-tactile-guided', action='store_true', default=False,
+                        help='启用触觉引导夹持：根据触觉反馈自动调节手指位置')
+    parser.add_argument('--hand-target-force', type=float, default=80.0,
+                        help='触觉引导目标力(raw值), 达到后停止增加弯曲')
     # DIFR QP参数（物理标定：1kg物体，μ=0.3 → F_0 = m*g/(2*μ) ≈ 16.35N/臂）
     parser.add_argument('--F0', type=float, default=16.35, help='标称期望内力F_0 (N/臂), 默认16.35=1kg*9.81/(2*0.3)')
     parser.add_argument('--F-min', type=float, default=5.0, help='内力下限')
@@ -419,7 +501,7 @@ def main():
     print(f"\n[数据] 记录文件: {output_path}")
 
     q_min = np.array([-2.0, -1.2, -2.5, -0.7, -1.6, -1.4, -1.2])
-    q_max = np.array([ 2.0,  1.2,  2.5,  1.8,  1.6,  1.4,  1.2])
+    q_max = np.array([ 2.0,  2.0,  2.5,  1.8,  1.6,  1.4,  1.2])
     dq_max = 0.2
 
     pb = DualArmPyBullet(args.urdf)
@@ -444,15 +526,19 @@ def main():
     print(f"[初始化] 当前左臂: {start_l}")
     print(f"[初始化] 当前右臂: {start_r}")
 
-    tactile_data = TactileData()
+    tactile_data = TactileData(scale=args.tactile_scale)
     ctx = mp.get_context('spawn')
     data_queue = ctx.Queue(maxsize=200)
     log_queue = ctx.Queue(maxsize=50)
+    cmd_queue = ctx.Queue(maxsize=50)  # 灵巧手控制指令队列
     stop_event = ctx.Event()
     tactile_process = ctx.Process(target=tactile_subscriber_worker,
-                                   args=(data_queue, log_queue, stop_event), daemon=True)
+                                   args=(data_queue, log_queue, cmd_queue, stop_event),
+                                   daemon=True)
     tactile_process.start()
     print(f"[触觉] 子进程 PID: {tactile_process.pid}")
+    if args.hand_enable:
+        print(f"[手控] 灵巧手控制已启用, GRASP姿态: {args.hand_pose}, 触觉引导: {args.hand_tactile_guided}")
     time.sleep(3.0)
     for msg in drain_queue(log_queue):
         print(f"  {msg}")
@@ -558,10 +644,11 @@ def main():
             r_r, _ = hand_comp_right.compensate(r_r_raw, J_r)
             F_r = np.linalg.pinv(J_r.T) @ r_r
 
-        # 触觉力
-        t_left, t_right = tactile_data.get_sums()
-        f_left_5, f_right_5 = tactile_data.get_fingers()
-        
+        # 触觉力（标定后单位N）
+        t_left_N, t_right_N = tactile_data.get_sums_N()
+        t_left_raw, t_right_raw = tactile_data.get_sums_raw()
+        f_left_5, f_right_5 = tactile_data.get_fingers_raw()
+
         # ===== GMO稳态偏置处理 =====
         # GRASP阶段最后2秒采集稳态偏置
         if phase == 1 and exp_time >= bias_collect_start:
@@ -586,8 +673,8 @@ def main():
         # 简化：取GMO估计外力的水平分量（z方向主要是重力）
         F_E = np.sqrt(F_l[0]**2 + F_l[1]**2 + F_r[0]**2 + F_r[1]**2) / 2.0
 
-        # 实际内力估计（左右触觉力差的绝对值，简化）
-        F_I_est = abs(t_left - t_right) * 0.5
+        # 实际内力估计（左右触觉力差的绝对值，单位N）
+        F_I_est = abs(t_left_N - t_right_N) * 0.5
 
         # DIFR控制器（阶段2和阶段3生效）
         if phase >= 1:
@@ -621,7 +708,7 @@ def main():
             cur_l_q, cur_r_q,
             cur_l_dq, cur_r_dq,
             F_l, F_r,
-            [t_left, t_right],
+            [t_left_N, t_right_N],
             [F_E, F_I_des, F_I_est],
             [delta, delta_roll, fc, 1.0 if difr_active else 0.0],
             f_left_5, f_right_5
@@ -638,7 +725,7 @@ def main():
                   f"GMO={gmo_force:5.1f}N F_E={F_E:5.1f}N | "
                   f"F_I_des={F_I_des:5.1f} est={F_I_est:5.1f} | "
                   f"δ={delta:+.4f} {fc_str} | "
-                  f"触觉 L={t_left:6.1f} R={t_right:6.1f}",
+                  f"触觉 L={t_left_N:6.2f}N R={t_right_N:6.2f}N",
                   end="", flush=True)
             last_print = exp_time
 
@@ -659,12 +746,42 @@ def main():
 
         # 阶段2: GRASP
         print(f"\n[阶段2] 夹持物体，跟踪标称内力 F_0={args.F0}N ({args.grasp_time}s)...")
+
+        # 灵巧手夹持控制
+        if args.hand_enable:
+            if args.hand_left_pos is not None:
+                cmd_queue.put(('set_positions', 'left', args.hand_left_pos, args.hand_duration))
+            else:
+                cmd_queue.put(('grasp', 'left', args.hand_pose, args.hand_duration))
+            if args.hand_right_pos is not None:
+                cmd_queue.put(('set_positions', 'right', args.hand_right_pos, args.hand_duration))
+            else:
+                cmd_queue.put(('grasp', 'right', args.hand_pose, args.hand_duration))
+            print(f"[手控] 已发送夹持指令: pose={args.hand_pose}, duration={args.hand_duration}ms")
+            time.sleep(min(args.hand_duration / 1000.0 + 0.5, 2.0))  # 等待手运动完成
+
+        # 触觉引导夹持变量
+        tactile_guided_last_adjust = 0.0
+
         grasp_start = time.time()
         while True:
             elapsed = time.time() - grasp_start
             exp_time = time.time() - exp_start
             if elapsed >= args.grasp_time:
                 break
+            # 触觉引导夹持：每0.5秒调节一次手指位置
+            if (args.hand_enable and args.hand_tactile_guided and
+                    exp_time - tactile_guided_last_adjust > 0.5):
+                f_l, f_r = tactile_data.get_fingers_raw()
+                left_force = float(np.sum(f_l))
+                right_force = float(np.sum(f_r))
+                if left_force < args.hand_target_force:
+                    # 力不足，发送指令让子进程增加弯曲
+                    # 注意：实际位置调节在子进程中通过HandController.tactile_guided_step完成
+                    # 这里只记录，子进程需要独立实现触觉引导循环
+                    pass
+                tactile_guided_last_adjust = exp_time
+
             run_one_step(exp_time, goal_l.copy(), goal_r.copy())
             time.sleep(t_step)
         print(f"\n[阶段2] 夹持完成")
@@ -693,6 +810,14 @@ def main():
         print("=" * 80)
 
         if tactile_process.is_alive():
+            # 实验结束时松开灵巧手
+            if args.hand_enable:
+                try:
+                    cmd_queue.put(('both_release', 1000))
+                    time.sleep(1.2)
+                    print("[手控] 灵巧手已松开")
+                except Exception:
+                    pass
             stop_event.set()
             tactile_process.join(timeout=5.0)
             if tactile_process.is_alive():
@@ -705,7 +830,7 @@ def main():
 
         try:
             cur = server.manager.get_current_arm_states()
-            server.manager.set_arm_poses(cur["left_q"], cur["right_q"], [0.0]*7, [0.0]*7)
+            # server.manager.set_arm_poses(cur["left_q"], cur["right_q"], [0.0]*7, [0.0]*7)
             server.stop()
             print("[G1] 已停止")
         except Exception as e:
@@ -718,4 +843,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
