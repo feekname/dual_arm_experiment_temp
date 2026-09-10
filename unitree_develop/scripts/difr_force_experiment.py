@@ -558,8 +558,8 @@ def main():
         if phase >= 1:
             F_I_des, delta_roll, delta, fc, difr_active = difr.update(
                 F_E, F_I_est, gmo_force, dt)
-            target_l[1] += args.roll_action_sign * delta_roll / 2.0
-            target_r[1] -= args.roll_action_sign * delta_roll / 2.0
+            target_l[1] -= args.roll_action_sign * delta_roll / 2.0
+            target_r[1] += args.roll_action_sign * delta_roll / 2.0
         else:
             F_I_des = args.F0
             delta_roll = 0.0
@@ -611,6 +611,7 @@ def main():
                   f"GMO={gmo_force:5.1f}N F_E={F_E:5.1f}N | "
                   f"F_I_des={F_I_des:5.1f} est={F_I_est:5.1f} | "
                   f"δ={delta:+.4f} {fc_str} | "
+                  f"delta_roll={delta_roll:+.4f} | "
                   f"左传感器 Fn={f_left_normal:5.1f} Ft={F_E_sensor:+5.1f}",
                   end="", flush=True)
             last_print = exp_time
