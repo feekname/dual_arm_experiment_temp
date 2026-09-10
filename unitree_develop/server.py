@@ -10,7 +10,7 @@ class G1Server:
     def __init__(self, network_interface: str, shm_name: str = "/dev/shm/6_axis_force_shm"):
         self.config = ArmConfig()
         self.manager = G1DualArmManager(self.config)
-        self.sensor = ForceSensorReader(shm_name)
+        # self.sensor = ForceSensorReader(shm_name)
         
         self.interface = network_interface
         self._subscribers: List[Callable] = []
@@ -31,7 +31,7 @@ class G1Server:
     def start(self):
         self.manager.start(self.interface)
         print('test1')
-        self.sensor.connect()
+        # self.sensor.connect()
         self._pub_thread = threading.Thread(target=self._status_publisher_loop, daemon=True)
         self._pub_thread.start()
         print("[Server] G1 服务端已就绪。安全限位已激活。")
@@ -61,7 +61,7 @@ class G1Server:
 
         # # 3. 停止Manager循环
         # self.manager.is_running = False
-        self.sensor.close()
+        # self.sensor.close()
         print("[Server] 系统已安全关闭。")
 
     # --- 核心安全检查：软限位 ---
@@ -186,7 +186,7 @@ class G1Server:
     def _status_publisher_loop(self):
         while not self._stop_event.is_set():
             state = self.manager.get_current_arm_states()
-            state["force_sensor"] = self.sensor.read_force()
+            # state["force_sensor"] = self.sensor.read_force()
             for sub in self._subscribers:
                 sub(state)
             time.sleep(0.01)
