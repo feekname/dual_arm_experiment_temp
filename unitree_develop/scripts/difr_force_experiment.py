@@ -394,8 +394,8 @@ def main():
     output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), output_file)
     print(f"\n[数据] 记录文件: {output_path}")
 
-    q_min = np.array([-2.0, -1.2, -2.5, -0.7, -1.6, -1.4, -1.2])
-    q_max = np.array([ 2.0,  1.2,  2.5,  1.8,  1.6,  1.4,  1.2])
+    q_min = np.array([-2.0, -1.2, -2.5, -0.7, -1.6, -1.6, -1.2])
+    q_max = np.array([ 2.0,  1.2,  2.5,  1.8,  1.6,  1.6,  1.2])
     dq_max = 0.2
 
     # 初始化力传感器
