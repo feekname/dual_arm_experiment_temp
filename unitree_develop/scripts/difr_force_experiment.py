@@ -148,7 +148,8 @@ class DIFRController:
     def __init__(self, F_0=16.35, F_min=5.0, F_max=40.0,
                  mu=0.3, m_object=1.0, alpha0=1.0, alpha1=1e8,
                  delta_min=-0.05, delta_max=0.05,
-                 collision_threshold=8.0, fc_threshold=0.8, K_f=0.002):
+                 collision_threshold=8.0, fc_threshold=0.8, K_f=0.002,
+                 roll_offset_max=0.10, force_deadband=0.2):
         self.F_0 = F_0
         self.F_min = F_min
         self.F_max = F_max
@@ -161,17 +162,21 @@ class DIFRController:
         self.collision_threshold = collision_threshold
         self.fc_threshold = fc_threshold
         self.K_f = K_f
+        self.roll_offset_max = roll_offset_max
+        self.force_deadband = force_deadband
 
         self.delta = 0.0
         self.delta_dot = 0.0
         self.F_I_des = F_0
         self.active = False
+        self.roll_offset = 0.0
 
     def reset(self):
         self.delta = 0.0
         self.delta_dot = 0.0
         self.F_I_des = self.F_0
         self.active = False
+        self.roll_offset = 0.0
 
     def update(self, F_E, F_I_est, gmo_force_norm, dt):
         '''
@@ -222,9 +227,14 @@ class DIFRController:
         self.F_I_des = F_I_des
         fc = force_demand / max(self.mu * F_I_des, 1e-6)
 
-        # 位置控制下的内力跟踪：肩关节roll相对偏移
-        delta_roll = self.K_f * (F_I_des - F_I_est)
-        delta_roll = np.clip(delta_roll, -0.05, 0.05)
+        # 简化力积分器：将力误差累计为肩roll位置偏移。
+        force_error = F_I_des - F_I_est
+        if abs(force_error) < self.force_deadband:
+            force_error = 0.0
+        self.roll_offset += self.K_f * force_error * dt
+        self.roll_offset = np.clip(
+            self.roll_offset, -self.roll_offset_max, self.roll_offset_max)
+        delta_roll = self.roll_offset
 
         return F_I_des, delta_roll, self.delta, fc, self.active
 
@@ -366,6 +376,10 @@ def main():
     parser.add_argument('--collision-threshold', type=float, default=8.0)
     parser.add_argument('--K-f', type=float, default=0.002,
                         help='内力→肩roll位置增益')
+    parser.add_argument('--roll-offset-max', type=float, default=0.10,
+                        help='左右肩roll相对偏移总量上限(rad)，每侧使用一半')
+    parser.add_argument('--force-deadband', type=float, default=0.2,
+                        help='内力误差死区(N)，用于减小稳态抖动')
     parser.add_argument('--roll-action-sign', type=float, choices=[-1.0, 1.0], default=1.0,
                         help='若增大指令反而减小夹持力，设为-1')
     # 关节角增量限幅
@@ -417,7 +431,9 @@ def main():
                            delta_min=args.delta_min, delta_max=args.delta_max,
                            fc_threshold=args.fc_threshold,
                            collision_threshold=args.collision_threshold,
-                           K_f=args.K_f)
+                           K_f=args.K_f,
+                           roll_offset_max=args.roll_offset_max,
+                           force_deadband=args.force_deadband)
 
     print(f"\n[初始化] 连接 G1...")
     server = G1Server(network_interface=args.interface, shm_name=args.shm_name)
@@ -555,11 +571,20 @@ def main():
         F_E = F_E_sensor
 
         # DIFR控制器（阶段2和阶段3生效）
-        if phase >= 1:
+        if phase == 1:
             F_I_des, delta_roll, delta, fc, difr_active = difr.update(
                 F_E, F_I_est, gmo_force, dt)
             target_l[1] -= args.roll_action_sign * delta_roll / 2.0
             target_r[1] += args.roll_action_sign * delta_roll / 2.0
+        elif phase == 2:
+            # 第三阶段尚未开放运动：冻结第二阶段最后下发的关节目标。
+            F_I_des = difr.F_I_des
+            delta_roll = difr.roll_offset
+            delta = difr.delta
+            fc = abs(F_E) / max(args.mu * F_I_des, 1e-6)
+            difr_active = False
+            target_l = last_target_l.copy()
+            target_r = last_target_r.copy()
         else:
             F_I_des = args.F0
             delta_roll = 0.0
