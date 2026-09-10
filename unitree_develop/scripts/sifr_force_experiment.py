@@ -484,14 +484,17 @@ def main():
             target_l[1] -= args.roll_action_sign * delta_roll / 2.0
             target_r[1] += args.roll_action_sign * delta_roll / 2.0
         elif phase == 2:
-            # 第三阶段尚未开放运动：只记录，保持第二阶段最后下发的目标。
-            F_I_des = args.F_fixed
-            delta_roll = sifr.roll_offset
-            delta = sifr.delta
-            fc = abs(F_E) / max(args.mu * F_I_des, 1e-6)
-            active = False
-            target_l = last_target_l.copy()
-            target_r = last_target_r.copy()
+            # # 第三阶段尚未开放运动：只记录，保持第二阶段最后下发的目标。
+            # F_I_des = args.F_fixed
+            # delta_roll = sifr.roll_offset
+            # delta = sifr.delta
+            # fc = abs(F_E) / max(args.mu * F_I_des, 1e-6)
+            # active = False
+            # target_l = last_target_l.copy()
+            # target_r = last_target_r.copy()
+            F_I_des, delta_roll, delta, fc, active = sifr.update(F_E, F_I_est, dt)
+            target_l[1] -= args.roll_action_sign * delta_roll / 2.0
+            target_r[1] += args.roll_action_sign * delta_roll / 2.0
         else:
             F_I_des = args.F_fixed
             delta_roll = 0.0
@@ -514,12 +517,15 @@ def main():
         last_target_r = target_r.copy()
 
         # 发送控制指令
-        if phase != 2:
-            server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
+        # if phase != 2:
+        #     server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
+        #                                 [0.0]*7, [0.0]*7)
+        # else:
+        #     print(f"\n[阶段{phase}] 期望内力 F_I_des={F_I_des:.2f}N, 实际内力 F_I_est={F_I_est:.2f}N, 滑动位移 δ={delta:.4f}, 摩擦裕度 fc={fc:.2f}")
+        #     print(f"\n夹持目标姿态: 左臂 {target_l}, 右臂 {target_r}")
+        
+        server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
                                         [0.0]*7, [0.0]*7)
-        else:
-            print(f"\n[阶段{phase}] 期望内力 F_I_des={F_I_des:.2f}N, 实际内力 F_I_est={F_I_est:.2f}N, 滑动位移 δ={delta:.4f}, 摩擦裕度 fc={fc:.2f}")
-            print(f"\n夹持目标姿态: 左臂 {target_l}, 右臂 {target_r}")
             
 
         # 记录
