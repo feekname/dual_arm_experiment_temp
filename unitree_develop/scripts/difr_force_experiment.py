@@ -582,7 +582,7 @@ def main():
         last_target_r = target_r.copy()
 
         # 发送控制指令
-        if phase == 0:
+        if phase != 2:
             server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
                                         [0.0]*7, [0.0]*7)
         else:

@@ -465,8 +465,8 @@ def main():
         # SIFR控制器（期望内力固定）
         if phase >= 1:
             F_I_des, delta_roll, delta, fc, active = sifr.update(F_E, F_I_est, dt)
-            target_l[1] += args.roll_action_sign * delta_roll / 2.0
-            target_r[1] -= args.roll_action_sign * delta_roll / 2.0
+            target_l[1] -= args.roll_action_sign * delta_roll / 2.0
+            target_r[1] += args.roll_action_sign * delta_roll / 2.0
         else:
             F_I_des = args.F_fixed
             delta_roll = 0.0
@@ -489,7 +489,7 @@ def main():
         last_target_r = target_r.copy()
 
         # 发送控制指令
-        if phase == 0:
+        if phase != 2:
             server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
                                         [0.0]*7, [0.0]*7)
         else:
