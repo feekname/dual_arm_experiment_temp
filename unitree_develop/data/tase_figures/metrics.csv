@@ -1,0 +1,5 @@
+method,trial,peak_tangential_N,mean_internal_N,peak_internal_N,peak_desired_internal_N,peak_estimated_slip_mm,friction_violation_percent,active_percent
+DIFR,difr_proposed,1.540612,2.6710629044117646,2.802881,8.0,0.0,100.0,0.0
+DIFR,difr_proposed_collision,3.519054,5.377468567062819,6.511896,10.0,1.694,98.64176570458405,25.29711375212224
+SIFR,sifr_baseline,1.813891,3.1178077207792207,3.279309,8.0,0.0,100.0,0.0
+SIFR,sifr_baseline_collision,3.284244,5.892662826086956,6.873478,8.0,10.199,25.25083612040134,0.0
