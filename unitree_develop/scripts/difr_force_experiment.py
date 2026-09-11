@@ -37,6 +37,7 @@ import os
 import sys
 import time
 import argparse
+from collections import deque
 import numpy as np
 import pybullet as p
 from datetime import datetime
@@ -520,7 +521,7 @@ def main():
                      "left_q(7) right_q(7) "
                      "left_gmo_F(3) right_gmo_F(3) "
                      "force_left_normal "
-                     "F_I_est(内力估计,N) F_E_gmo(GMO外力,N) F_E_sensor(传感器外力,N) "
+                     "F_I_est(内力估计,N) F_E_corrected(TEST切向碰撞力,N) F_E_sensor_raw(N) "
                      "F_I_des(期望内力) delta(滑动位移) action_offset(执行偏移) "
                      "fc(摩擦锥裕度) difr_active "
                      "force_left_6dof(6) "
@@ -556,6 +557,14 @@ def main():
     gmo_bias_samples_r = []
     gmo_bias_applied = False
     bias_collect_start = args.move_time + args.grasp_time - 2.0
+    tangent_bias_samples = []
+    tangent_bias = 0.0
+    tangent_bias_applied = False
+    test_dynamic_state_reset = False
+    recent_external_abs = deque(maxlen=10)  # 100 Hz下最近约100 ms
+    test_external_abs_history = []
+    test_external_peak_abs = 0.0
+    test_external_peak_signed = 0.0
 
     def get_phase(exp_time):
         if exp_time < args.move_time:
@@ -570,6 +579,8 @@ def main():
         nonlocal gmo_bias_F_l, gmo_bias_F_r, gmo_bias_samples_l, gmo_bias_samples_r, gmo_bias_applied
         nonlocal last_target_l, last_target_r
         nonlocal actual_closure_origin
+        nonlocal tangent_bias, tangent_bias_applied, test_dynamic_state_reset
+        nonlocal test_external_peak_abs, test_external_peak_signed
 
         now = time.time()
         dt = now - last_time
@@ -637,8 +648,28 @@ def main():
         # GMO碰撞力（双臂平均）
         gmo_force = (np.linalg.norm(F_l) + np.linalg.norm(F_r)) / 2.0
 
-        # 论文公式(39)-(41)所需接触力直接取左手六维传感器。
-        F_E = F_E_sensor
+        # 论文公式(39)-(41)使用GRASP末尾稳态切向力去偏后的碰撞分量。
+        if phase == 1 and exp_time >= bias_collect_start:
+            tangent_bias_samples.append(float(F_E_sensor))
+        if phase == 2:
+            if not tangent_bias_applied:
+                if tangent_bias_samples:
+                    tangent_bias = float(np.median(tangent_bias_samples))
+                tangent_bias_applied = True
+                print(f"\n[力传感器] TEST切向力稳态偏置: {tangent_bias:+.3f}N")
+            if not test_dynamic_state_reset:
+                difr.delta = 0.0
+                difr.delta_dot = 0.0
+                difr.active = False
+                test_dynamic_state_reset = True
+            F_E = F_E_sensor - tangent_bias
+            recent_external_abs.append(abs(F_E))
+            test_external_abs_history.append(abs(F_E))
+            if abs(F_E) > test_external_peak_abs:
+                test_external_peak_abs = abs(F_E)
+                test_external_peak_signed = F_E
+        else:
+            F_E = 0.0
 
         # DIFR控制器（阶段2和阶段3生效）
         if phase >= 1:
@@ -714,11 +745,16 @@ def main():
                            f"{np.degrees(right_tracking_rmse):.2f}deg"
                            if args.actuation_mode == 'ik' else
                            f"delta_roll={delta_roll:+.4f}rad")
+            impact_text = (f"Fext={F_E:+.2f}N "
+                           f"mean100ms={np.mean(recent_external_abs):.2f}N "
+                           f"peak100ms={max(recent_external_abs, default=0.0):.2f}N "
+                           f"TESTpeak={test_external_peak_abs:.2f}N"
+                           if phase == 2 else "Fext=waiting-for-TEST")
             print(f"\r  t={exp_time:5.2f}s [{phase_str}] [{active_str}] | "
                   f"GMO={gmo_force:5.1f}N F_E={F_E:5.1f}N | "
                   f"F_I_des={F_I_des:5.1f} est={F_I_est:5.1f} | "
                   f"δ={delta:+.4f} {fc_str} | "
-                  f"{action_text} | "
+                  f"{action_text} | {impact_text} | "
                   f"左传感器 Fn={f_left_normal:5.1f} Ft={F_E_sensor:+5.1f}",
                   end="", flush=True)
             last_print = exp_time
@@ -761,6 +797,12 @@ def main():
             run_one_step(exp_time, goal_l.copy(), goal_r.copy())
             time.sleep(t_step)
         print(f"\n[阶段3] 测试完成")
+        smooth_peak = (float(np.max(np.convolve(
+            np.asarray(test_external_abs_history), np.ones(5)/5.0, mode='valid')))
+            if len(test_external_abs_history) >= 5 else test_external_peak_abs)
+        print(f"[碰撞统计] TEST峰值外力={test_external_peak_abs:.3f}N "
+              f"(signed={test_external_peak_signed:+.3f}N), "
+              f"50ms平滑峰值={smooth_peak:.3f}N")
 
     except KeyboardInterrupt:
         print("\n\n[中断] 用户中断")
