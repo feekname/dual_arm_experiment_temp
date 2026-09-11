@@ -35,6 +35,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server import G1Server
 from shm_handler import ForceSensorReader
+from normal_ik_actuator import SymmetricNormalIKActuator
 
 
 # ================================================================
@@ -117,12 +118,15 @@ class SIFRController:
     仍然估计滑动位移δ（用于记录对比），但不用于调节内力
     '''
     def __init__(self, F_fixed=16.35, mu=0.3, m_object=1.0, K_f=0.002,
-                 roll_offset_max=0.10, force_deadband=0.2):
+                 roll_offset_max=0.10, force_deadband=0.2,
+                 roll_offset_min=None):
         self.F_fixed = F_fixed
         self.mu = mu
         self.m_object = m_object
         self.K_f = K_f
         self.roll_offset_max = roll_offset_max
+        self.roll_offset_min = (-roll_offset_max if roll_offset_min is None
+                                else roll_offset_min)
         self.force_deadband = force_deadband
         self.delta = 0.0
         self.delta_dot = 0.0
@@ -159,7 +163,7 @@ class SIFRController:
             force_error = 0.0
         self.roll_offset += self.K_f * force_error * dt
         self.roll_offset = np.clip(
-            self.roll_offset, -self.roll_offset_max, self.roll_offset_max)
+            self.roll_offset, self.roll_offset_min, self.roll_offset_max)
         delta_roll = self.roll_offset
 
         return F_I_des, delta_roll, self.delta, fc, False
@@ -194,11 +198,21 @@ class DualArmPyBullet:
             self.left_joints = self.all_revolute[:7]
         if len(self.right_joints) != 7:
             self.right_joints = self.all_revolute[-7:]
-        self.left_ee = self.left_joints[-1] + 1
-        self.right_ee = self.right_joints[-1] + 1
+        link_to_id = {
+            p.getJointInfo(self.robot_id, jid)[12].decode(): jid
+            for jid in range(p.getNumJoints(self.robot_id))
+        }
+        try:
+            self.left_ee = link_to_id["left_base_link"]
+            self.right_ee = link_to_id["right_base_link"]
+        except KeyError as exc:
+            raise RuntimeError(
+                "URDF中未找到IK末端left_base_link/right_base_link") from exc
         self.left_pos = [self.joint_to_pos[jid] for jid in self.left_joints]
         self.right_pos = [self.joint_to_pos[jid] for jid in self.right_joints]
         print(f"[PyBullet] 左臂: {self.left_joints}, 右臂: {self.right_joints}")
+        print(f"[PyBullet] IK末端: left_base_link={self.left_ee}, "
+              f"right_base_link={self.right_ee}")
 
     def _build_full(self, arm, q7, dq7=None):
         full_q = np.zeros(self.n_total)
@@ -281,26 +295,44 @@ def main():
                         help='ATI FT_api.h中的System V key，默认0x1234')
     parser.add_argument('--force-bias-samples', type=int, default=200)
     parser.add_argument('--normal-axis', choices='xyz', default='z')
-    parser.add_argument('--tangent-axis', choices='xyz', default='y')
-    parser.add_argument('--normal-sign', type=float, choices=[-1.0, 1.0], default=1.0)
-    parser.add_argument('--tangent-sign', type=float, choices=[-1.0, 1.0], default=1.0)
+    parser.add_argument('--tangent-axis', choices='xyz', default='x')
+    parser.add_argument('--normal-sign', type=float, choices=[-1.0, 1.0], default=-1.0)
+    parser.add_argument('--tangent-sign', type=float, choices=[-1.0, 1.0], default=-1.0)
     # SIFR参数
     parser.add_argument('--F-fixed', type=float, default=16.35,
                         help='固定期望内力 (N), 默认16.35=1kg*9.81/(2*0.3)')
     parser.add_argument('--mu', type=float, default=0.3)
     parser.add_argument('--m-object', type=float, default=1.0)
-    parser.add_argument('--K-f', type=float, default=0.002)
+    parser.add_argument('--K-f', type=float, default=0.002,
+                        help='roll模式的力误差积分增益，单位rad/(N*s)')
+    parser.add_argument('--actuation-mode', choices=['roll', 'ik'], default='roll',
+                        help='roll=旧肩关节方案；ik=双手沿连线法向对称闭合')
     parser.add_argument('--roll-offset-max', type=float, default=0.10,
                         help='左右肩roll相对偏移总量上限(rad)，每侧使用一半')
     parser.add_argument('--force-deadband', type=float, default=0.2,
                         help='内力误差死区(N)，用于减小稳态抖动')
     parser.add_argument('--roll-action-sign', type=float, choices=[-1.0, 1.0], default=1.0,
                         help='若增大指令反而减小夹持力，设为-1')
+    parser.add_argument('--ik-max-displacement', type=float, default=0.015,
+                        help='IK模式每只手最大法向位移(m)，两手总闭合量为其2倍')
+    parser.add_argument('--ik-force-gain', type=float, default=0.0002,
+                        help='IK模式力误差积分增益，单位m/(N*s)')
+    parser.add_argument('--ik-damping', type=float, default=0.04)
+    parser.add_argument('--ik-iterations', type=int, default=160)
+    parser.add_argument('--ik-max-step', type=float, default=0.005,
+                        help='启动时IK每次迭代的单关节最大步长(rad)')
     # 关节角增量限幅
     parser.add_argument('--joint-delta-max', type=float, default=0.008)
+    parser.add_argument('--ik-joint-delta-max', type=float, default=0.001,
+                        help='IK模式每帧单关节最大变化量(rad)，并与joint-delta-max取较小值')
     parser.add_argument('--output', type=str, default='sifr_force.txt')
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
+    if args.actuation_mode == 'ik':
+        if not (0.0 < args.ik_max_displacement <= 0.04):
+            parser.error('--ik-max-displacement必须在(0, 0.04] m内；更大位移需先重新仿真验证')
+        if args.ik_force_gain <= 0.0 or args.ik_joint_delta_max <= 0.0:
+            parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
 
     print("=" * 80)
     print("  SIFR 双臂协作搬运实验 (力传感器版本, 对比实验)")
@@ -310,6 +342,7 @@ def main():
     print(f"  阶段2 GRASP: {args.grasp_time}s (GMO去偏采集)")
     print(f"  阶段3 TEST:  {args.test_time}s (期望内力固定={args.F_fixed}N)")
     print(f"  力传感器共享内存: {args.shm_name}")
+    print(f"  执行方式: {args.actuation_mode.upper()}")
     print("=" * 80)
 
     if args.output:
@@ -337,10 +370,26 @@ def main():
     pb = DualArmPyBullet(args.urdf)
     gmo_left = GMOObserver(7, args.gmo_gain)
     gmo_right = GMOObserver(7, args.gmo_gain)
+    action_max = (2.0 * args.ik_max_displacement
+                  if args.actuation_mode == 'ik' else args.roll_offset_max)
+    force_gain = args.ik_force_gain if args.actuation_mode == 'ik' else args.K_f
     sifr = SIFRController(F_fixed=args.F_fixed, mu=args.mu,
-                           m_object=args.m_object, K_f=args.K_f,
-                           roll_offset_max=args.roll_offset_max,
-                           force_deadband=args.force_deadband)
+                           m_object=args.m_object, K_f=force_gain,
+                           roll_offset_max=action_max,
+                           force_deadband=args.force_deadband,
+                           roll_offset_min=(0.0 if args.actuation_mode == 'ik' else None))
+
+    goal_l = np.array(args.left_q)
+    goal_r = np.array(args.right_q)
+    ik_actuator = None
+    if args.actuation_mode == 'ik':
+        ik_actuator = SymmetricNormalIKActuator(
+            pb, goal_l, goal_r,
+            max_displacement=args.ik_max_displacement,
+            damping=args.ik_damping,
+            iterations=args.ik_iterations,
+            max_step=args.ik_max_step,
+            q_min=q_min, q_max=q_max)
 
     print(f"\n[初始化] 连接 G1...")
     server = G1Server(network_interface=args.interface, shm_name=args.shm_name)
@@ -349,8 +398,6 @@ def main():
     current = server.manager.get_current_arm_states()
     start_l = np.array(current["left_q"])
     start_r = np.array(current["right_q"])
-    goal_l = np.array(args.left_q)
-    goal_r = np.array(args.right_q)
     print(f"[初始化] 当前左臂: {start_l}")
     print(f"[初始化] 当前右臂: {start_r}")
 
@@ -372,12 +419,14 @@ def main():
     data_file.write(f"# 时间: {datetime.now()}\n")
     data_file.write(f"# 阶段: MOVE={args.move_time}s, GRASP={args.grasp_time}s, TEST={args.test_time}s\n")
     data_file.write(f"# 参数: F_fixed={args.F_fixed}, mu={args.mu}, m_object={args.m_object}\n")
+    data_file.write(f"# actuation_mode: {args.actuation_mode}\n")
+    data_file.write(f"# action_offset_unit: {'m_total_closure' if args.actuation_mode == 'ik' else 'rad_total_roll'}\n")
     data_file.write("# 列: time phase(0=MOVE,1=GRASP,2=TEST) "
                      "left_q(7) right_q(7) "
                      "left_gmo_F(3) right_gmo_F(3) "
                      "force_left_normal "
                      "F_I_est(内力估计,N) F_E_gmo(GMO外力,N) F_E_sensor(传感器外力,N) "
-                     "F_I_des(=F_fixed) delta(滑动位移) delta_roll(肩roll偏移) "
+                     "F_I_des(=F_fixed) delta(滑动位移) action_offset(执行偏移) "
                      "fc(摩擦锥裕度) sifr_active(始终0) "
                      "force_left_6dof(6)\n")
     data_file.write("#" + "=" * 80 + "\n")
@@ -479,22 +528,13 @@ def main():
         F_E = F_E_sensor
 
         # SIFR控制器（期望内力固定）
-        if phase == 1:
+        if phase >= 1:
             F_I_des, delta_roll, delta, fc, active = sifr.update(F_E, F_I_est, dt)
-            target_l[1] -= args.roll_action_sign * delta_roll / 2.0
-            target_r[1] += args.roll_action_sign * delta_roll / 2.0
-        elif phase == 2:
-            # # 第三阶段尚未开放运动：只记录，保持第二阶段最后下发的目标。
-            # F_I_des = args.F_fixed
-            # delta_roll = sifr.roll_offset
-            # delta = sifr.delta
-            # fc = abs(F_E) / max(args.mu * F_I_des, 1e-6)
-            # active = False
-            # target_l = last_target_l.copy()
-            # target_r = last_target_r.copy()
-            F_I_des, delta_roll, delta, fc, active = sifr.update(F_E, F_I_est, dt)
-            target_l[1] -= args.roll_action_sign * delta_roll / 2.0
-            target_r[1] += args.roll_action_sign * delta_roll / 2.0
+            if args.actuation_mode == 'ik':
+                target_l, target_r, _ = ik_actuator.targets(delta_roll)
+            else:
+                target_l[1] -= args.roll_action_sign * delta_roll / 2.0
+                target_r[1] += args.roll_action_sign * delta_roll / 2.0
         else:
             F_I_des = args.F_fixed
             delta_roll = 0.0
@@ -509,23 +549,18 @@ def main():
         # 关节角增量限幅
         delta_l = target_l - last_target_l
         delta_r = target_r - last_target_r
-        delta_l = np.clip(delta_l, -args.joint_delta_max, args.joint_delta_max)
-        delta_r = np.clip(delta_r, -args.joint_delta_max, args.joint_delta_max)
+        frame_limit = (min(args.joint_delta_max, args.ik_joint_delta_max)
+                       if args.actuation_mode == 'ik' else args.joint_delta_max)
+        delta_l = np.clip(delta_l, -frame_limit, frame_limit)
+        delta_r = np.clip(delta_r, -frame_limit, frame_limit)
         target_l = last_target_l + delta_l
         target_r = last_target_r + delta_r
         last_target_l = target_l.copy()
         last_target_r = target_r.copy()
 
         # 发送控制指令
-        # if phase != 2:
-        #     server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
-        #                                 [0.0]*7, [0.0]*7)
-        # else:
-        #     print(f"\n[阶段{phase}] 期望内力 F_I_des={F_I_des:.2f}N, 实际内力 F_I_est={F_I_est:.2f}N, 滑动位移 δ={delta:.4f}, 摩擦裕度 fc={fc:.2f}")
-        #     print(f"\n夹持目标姿态: 左臂 {target_l}, 右臂 {target_r}")
-        
         server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
-                                        [0.0]*7, [0.0]*7)
+                                     [0.0]*7, [0.0]*7)
             
 
         # 记录
@@ -549,7 +584,9 @@ def main():
                   f"GMO={gmo_force:5.1f}N F_E={F_E:5.1f}N | "
                   f"F_I={F_I_des:5.1f}(fixed) est={F_I_est:5.1f} | "
                   f"δ={delta:+.4f} {fc_str} | "
-                  f"delta_roll={delta_roll:+.4f} | "
+                  f"{'closure' if args.actuation_mode == 'ik' else 'delta_roll'}="
+                  f"{delta_roll * (1000.0 if args.actuation_mode == 'ik' else 1.0):+.4f}"
+                  f"{'mm' if args.actuation_mode == 'ik' else 'rad'} | "
                   f"左传感器 Fn={f_left_normal:5.1f} Ft={F_E_sensor:+5.1f}",
                   end="", flush=True)
             last_print = exp_time
