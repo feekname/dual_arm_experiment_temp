@@ -140,6 +140,36 @@ def collision_span(a, b):
     return min(a["impact_start"], b["impact_start"]), max(a["impact_end"], b["impact_end"])
 
 
+def mark_declared_drops(pairs, labels, dropped_labels, nominal,
+                        force_fraction=0.30, hold_seconds=0.25):
+    """Attach a drop time to declared SIFR trials.
+
+    The declaration is treated as ground truth.  The force signal is used only
+    to place the marker: first sustained post-impact loss of normal force.
+    """
+    dropped_labels = set(dropped_labels)
+    for (sifr, difr), label in zip(pairs, labels):
+        for d in (sifr, difr):
+            d["dropped"] = False
+            d["drop_time"] = np.nan
+        if label not in dropped_labels:
+            continue
+        sifr["dropped"] = True
+        rel = sifr["relative_time"]
+        low = (rel >= 0.0) & (np.abs(sifr["internal"]) < force_fraction*nominal)
+        hold_n = max(1, int(round(hold_seconds/max(sifr["dt"], 1e-6))))
+        run = 0
+        for i, flag in enumerate(low):
+            run = run + 1 if flag else 0
+            if run >= hold_n:
+                sifr["drop_time"] = float(rel[i-hold_n+1])
+                break
+        if not np.isfinite(sifr["drop_time"]):
+            # A declared drop is still shown even if normal force does not give
+            # an unambiguous transition (e.g. sensor unloads slowly).
+            sifr["drop_time"] = max(0.0, float(sifr["impact_end"]))
+
+
 def style_axis(ax, before, after, xlabel=False):
     ax.set_xlim(-before, after)
     ax.margins(x=0)
@@ -155,7 +185,8 @@ def save_figure(fig, out, stem):
     plt.close(fig)
 
 
-def time_history_figure(pairs, labels, out, mu, nominal, before, after):
+def time_history_figure(pairs, labels, out, mu, nominal, before, after,
+                        slip_plot_limit_mm):
     n = len(pairs)
     fig, axes = plt.subplots(4, n, figsize=(7.16, 6.4), sharex="col", squeeze=False)
     for col, ((sifr, difr), label) in enumerate(zip(pairs, labels)):
@@ -166,6 +197,16 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after):
             axes[row, col].axvspan(span[0], span[1], color=COLLISION_FILL,
                                   zorder=0)
             axes[row, col].axvline(0.0, color="#777777", linestyle=":", linewidth=0.8)
+            if sifr.get("dropped", False):
+                drop_t = sifr["drop_time"]
+                axes[row, col].axvspan(drop_t, after, facecolor="#eeeeee",
+                                      edgecolor="#aaaaaa", hatch="////",
+                                      alpha=.55, linewidth=0, zorder=.2)
+        if sifr.get("dropped", False):
+            axes[0, col].text(sifr["drop_time"]+.04, .96, "Object dropped",
+                              transform=axes[0, col].get_xaxis_transform(),
+                              va="top", ha="left", rotation=90,
+                              color=BASELINE, fontsize=7.2)
 
         ax = axes[0, col]
         for d, name, color, ls in ((difr, "DIFR", PROPOSED, "-"),
@@ -193,7 +234,9 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after):
         for d, name, color, ls in ((difr, "DIFR", PROPOSED, "-"),
                                     (sifr, "SIFR", BASELINE, "--")):
             t, y = crop(d, "slip", before, after)
-            ax.plot(t, 1000*y, color=color, linestyle=ls, label=name)
+            y_mm = 1000*y
+            ax.plot(t, np.clip(y_mm, -slip_plot_limit_mm, slip_plot_limit_mm),
+                    color=color, linestyle=ls, label=name)
         ax.set_ylabel(r"$\delta$ [mm]" if col == 0 else "")
 
         ax = axes[3, col]
@@ -216,6 +259,9 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after):
         Line2D([0], [0], color="#999999", linestyle="-.", label="Nominal force"),
         Patch(facecolor=COLLISION_FILL, edgecolor="none", label="Impact interval"),
     ]
+    if any(s.get("dropped", False) for s, _ in pairs):
+        legend_handles.append(Patch(facecolor="#eeeeee", edgecolor="#aaaaaa",
+                                    hatch="////", label="Contact lost / dropped"))
     fig.legend(handles=legend_handles, ncol=5, frameon=False,
                loc="upper center", bbox_to_anchor=(.54, .995),
                columnspacing=1.1, handlelength=2.4)
@@ -236,11 +282,12 @@ def metric_row(d, method, condition, mu):
         "peak_friction_utilization": float(np.max(fc[c])),
         "friction_violation_ms": float(1000*np.count_nonzero(fc[c] > 1.0)*d["dt"]),
         "peak_estimated_slip_mm": float(1000*np.max(np.abs(d["slip"][c]))),
+        "object_dropped": int(bool(d.get("dropped", False))),
         "baseline_removed_N": d["external_baseline"],
     }
 
 
-def grouped_metric_figure(rows, labels, out, sifr_dropped):
+def grouped_metric_figure(rows, labels, out, sifr_dropped, slip_plot_limit_mm):
     fig, axes = plt.subplots(2, 2, figsize=(7.16, 4.4))
     metrics = (("peak_external_N", "Measured disturbance peak [N]"),
                ("peak_internal_N", "Peak internal force [N]"),
@@ -252,6 +299,10 @@ def grouped_metric_figure(rows, labels, out, sifr_dropped):
              for lab in labels]
         d = [next(r[key] for r in rows if r["condition"] == lab and r["method"] == "DIFR")
              for lab in labels]
+        raw_s, raw_d = list(s), list(d)
+        if key == "peak_estimated_slip_mm":
+            s = np.minimum(s, slip_plot_limit_mm)
+            d = np.minimum(d, slip_plot_limit_mm)
         # Paired dumbbell plot is visually lighter than bars and makes unfair
         # disturbance matching immediately visible.
         for xi, sv, dv in zip(x, s, d):
@@ -270,11 +321,21 @@ def grouped_metric_figure(rows, labels, out, sifr_dropped):
         if key == "peak_friction_utilization":
             ax.axhline(1.0, color=DESIRED, linestyle=":", linewidth=1.0)
         if key == "peak_estimated_slip_mm":
-            for xi, lab, value in zip(x, labels, s):
+            for xi, lab, value, raw in zip(x, labels, s, raw_s):
                 if lab in sifr_dropped:
                     ax.annotate("Dropped", (xi-.10, value), xytext=(0, 7),
                                 textcoords="offset points", ha="center",
                                 color=BASELINE, fontsize=7.5, fontstyle="italic")
+                elif raw > slip_plot_limit_mm:
+                    ax.annotate("estimator overflow", (xi-.10, value), xytext=(0, 7),
+                                textcoords="offset points", ha="center",
+                                color=BASELINE, fontsize=6.8, fontstyle="italic")
+            for xi, value, raw in zip(x, d, raw_d):
+                if raw > slip_plot_limit_mm:
+                    ax.annotate(rf"$>{slip_plot_limit_mm:g}$", (xi+.10, value),
+                                xytext=(0, 7), textcoords="offset points",
+                                ha="center", color=PROPOSED, fontsize=7)
+            ax.set_ylim(bottom=0, top=1.18*slip_plot_limit_mm)
     titles = ("(a) Matched disturbance", "(b) Internal-force response",
               "(c) Friction-cone margin", "(d) Slip-state response")
     for ax, title in zip(axes.flat, titles):
@@ -297,7 +358,17 @@ def friction_margin_figure(pairs, labels, out, mu, before, after):
             margin = mu*np.abs(d["internal"]) - d["external"]
             d["friction_margin"] = margin
             t, y = crop(d, "friction_margin", before, after)
+            if d.get("dropped", False):
+                y = y.copy()
+                y[t >= d["drop_time"]] = np.nan
             ax.plot(t, y, color=color, linestyle=ls, label=name)
+        if sifr.get("dropped", False):
+            ax.axvspan(sifr["drop_time"], after, facecolor="#eeeeee",
+                       edgecolor="#aaaaaa", hatch="////", alpha=.65,
+                       linewidth=0, zorder=.2)
+            ax.text(sifr["drop_time"]+.04, .96, "contact lost",
+                    transform=ax.get_xaxis_transform(), va="top", ha="left",
+                    rotation=90, color=BASELINE, fontsize=7)
         ax.axhline(0, color=DESIRED, linestyle=":", linewidth=1.0)
         ax.axvline(0, color="#777777", linestyle=":", linewidth=.8)
         ax.set_title(f"({chr(97+col)}) {label}")
@@ -330,9 +401,16 @@ def force_space_figure(pairs, labels, out, mu):
                      (d["post_mask"], "Post-impact", SAFE))
             step = max(1, len(fi)//1000)
             for mask, phase, color in masks:
+                if d.get("dropped", False):
+                    mask = mask & (d["relative_time"] < d["drop_time"])
                 idx = np.flatnonzero(mask)[::step]
                 ax.scatter(fi[idx], fe[idx], s=7, color=color, alpha=.58,
                            linewidths=0, label=phase if col == 0 else None)
+            if d.get("dropped", False):
+                k = int(np.nanargmin(np.abs(d["relative_time"]-d["drop_time"])))
+                ax.scatter(fi[k], fe[k], s=30, marker="x", color="black",
+                           linewidths=1.0, zorder=5,
+                           label="Contact lost" if col == 0 else None)
             ax.plot(xline, mu*xline, color=DESIRED, linestyle="--", linewidth=1.1,
                     label=rf"$|F_E|=\mu F_I$" if col == 0 else None)
             ax.fill_between(xline, 0, mu*xline, color="#e6f2e6", zorder=-1)
@@ -358,6 +436,12 @@ def main():
     ap.add_argument("--labels", nargs="+", help="condition labels, e.g. Low Medium High")
     ap.add_argument("--sifr-dropped", nargs="*", default=[], metavar="LABEL",
                     help="condition labels where the SIFR trial dropped the object")
+    ap.add_argument("--drop-force-fraction", type=float, default=0.30,
+                    help="normal-force fraction used to place declared drop marker")
+    ap.add_argument("--drop-hold", type=float, default=0.25,
+                    help="required sustained force loss [s] for drop marker")
+    ap.add_argument("--slip-plot-limit-mm", type=float, default=50.0,
+                    help="display limit for the slip estimator; raw values stay in CSV")
     ap.add_argument("--mu", type=float, default=0.4)
     ap.add_argument("--mass", type=float, default=0.2)
     ap.add_argument("--nominal-force", type=float, default=3.0)
@@ -392,13 +476,20 @@ def main():
                           args.force_smooth_ms, args.impact_fraction)
         pairs.append((s, d))
 
+    unknown_drops = set(args.sifr_dropped) - set(labels)
+    if unknown_drops:
+        ap.error("--sifr-dropped contains unknown labels: " + ", ".join(sorted(unknown_drops)))
+    mark_declared_drops(pairs, labels, args.sifr_dropped, args.nominal_force,
+                        args.drop_force_fraction, args.drop_hold)
+
     time_history_figure(pairs, labels, out, args.mu, args.nominal_force,
-                        args.before, args.after)
+                        args.before, args.after, args.slip_plot_limit_mm)
     rows = []
     for (s, d), label in zip(pairs, labels):
         rows.extend((metric_row(s, "SIFR", label, args.mu),
                      metric_row(d, "DIFR", label, args.mu)))
-    grouped_metric_figure(rows, labels, out, set(args.sifr_dropped))
+    grouped_metric_figure(rows, labels, out, set(args.sifr_dropped),
+                          args.slip_plot_limit_mm)
     friction_margin_figure(pairs, labels, out, args.mu, args.before, args.after)
     force_space_figure(pairs, labels, out, args.mu)
 
