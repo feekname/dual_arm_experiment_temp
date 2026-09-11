@@ -8,6 +8,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import numpy as np
 
 
@@ -99,12 +101,24 @@ def prepare_event(d, baseline_seconds, smooth_ms, impact_fraction):
 
     threshold = max(0.15, impact_fraction * peak)
     above = magnitude >= threshold
+    # Bridge brief gaps between peaks from the same physical push. The former
+    # strictly-contiguous rule could reduce an impulsive trial to one sample.
+    max_gap = max(1, round(0.15/max(dt, 1e-6)))
+    indices = np.flatnonzero(above)
+    left_candidates = indices[indices <= peak_index]
+    right_candidates = indices[indices >= peak_index]
     lo = peak_index
+    last = peak_index
+    for idx in left_candidates[::-1]:
+        if last - idx > max_gap:
+            break
+        lo = int(idx); last = int(idx)
     hi = peak_index
-    while lo > 0 and above[lo-1]:
-        lo -= 1
-    while hi+1 < len(above) and above[hi+1]:
-        hi += 1
+    last = peak_index
+    for idx in right_candidates:
+        if idx - last > max_gap:
+            break
+        hi = int(idx); last = int(idx)
     d.update({
         "external": magnitude, "external_signed": filtered,
         "relative_time": rel, "peak_external": peak,
@@ -143,12 +157,14 @@ def save_figure(fig, out, stem):
 
 def time_history_figure(pairs, labels, out, mu, nominal, before, after):
     n = len(pairs)
-    fig, axes = plt.subplots(3, n, figsize=(7.16, 5.6), sharex="col", squeeze=False)
+    fig, axes = plt.subplots(4, n, figsize=(7.16, 6.4), sharex="col", squeeze=False)
     for col, ((sifr, difr), label) in enumerate(zip(pairs, labels)):
         span = collision_span(sifr, difr)
-        for row in range(3):
+        mismatch = abs(sifr["peak_external"]-difr["peak_external"]) / max(
+            .5*(sifr["peak_external"]+difr["peak_external"]), 1e-6)
+        for row in range(4):
             axes[row, col].axvspan(span[0], span[1], color=COLLISION_FILL,
-                                  zorder=0, label="Impact interval" if col == 0 else None)
+                                  zorder=0)
             axes[row, col].axvline(0.0, color="#777777", linestyle=":", linewidth=0.8)
 
         ax = axes[0, col]
@@ -156,8 +172,10 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after):
                                     (sifr, "SIFR", BASELINE, "--")):
             t, y = crop(d, "external", before, after)
             ax.plot(t, y, color=color, linestyle=ls, label=name)
-        ax.set_title(f"({chr(97+col)}) {label}\n"
-                     f"peaks: {sifr['peak_external']:.2f}/{difr['peak_external']:.2f} N")
+        warning = " - unmatched" if mismatch > .10 else ""
+        ax.set_title(f"({chr(97+col)}) {label}{warning}\n"
+                     f"$F_{{E,pk}}$ S/D: {sifr['peak_external']:.2f}/"
+                     f"{difr['peak_external']:.2f} N")
         ax.set_ylabel(r"$|F_E|$ [N]" if col == 0 else "")
 
         ax = axes[1, col]
@@ -174,6 +192,13 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after):
         ax = axes[2, col]
         for d, name, color, ls in ((difr, "DIFR", PROPOSED, "-"),
                                     (sifr, "SIFR", BASELINE, "--")):
+            t, y = crop(d, "slip", before, after)
+            ax.plot(t, 1000*y, color=color, linestyle=ls, label=name)
+        ax.set_ylabel(r"$\delta$ [mm]" if col == 0 else "")
+
+        ax = axes[3, col]
+        for d, name, color, ls in ((difr, "DIFR", PROPOSED, "-"),
+                                    (sifr, "SIFR", BASELINE, "--")):
             measured_fc = d["external"] / np.maximum(mu*np.abs(d["internal"]), 1e-6)
             d["fc_measured"] = measured_fc
             t, y = crop(d, "fc_measured", before, after)
@@ -181,13 +206,21 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after):
         ax.axhline(1.0, color=DESIRED, linestyle=":", label="friction boundary")
         ax.set_ylabel(r"$|F_E|/(\mu F_I)$" if col == 0 else "")
 
-        for row in range(3):
-            style_axis(axes[row, col], before, after, xlabel=(row == 2))
-            if col == 0:
-                axes[row, col].legend(frameon=False, loc="best")
+        for row in range(4):
+            style_axis(axes[row, col], before, after, xlabel=(row == 3))
 
-    fig.subplots_adjust(left=.085, right=.995, bottom=.09, top=.91,
-                        wspace=.20, hspace=.20)
+    legend_handles = [
+        Line2D([0], [0], color=PROPOSED, linestyle="-", label="DIFR"),
+        Line2D([0], [0], color=BASELINE, linestyle="--", label="SIFR"),
+        Line2D([0], [0], color=DESIRED, linestyle=":", label="DIFR desired / boundary"),
+        Line2D([0], [0], color="#999999", linestyle="-.", label="Nominal force"),
+        Patch(facecolor=COLLISION_FILL, edgecolor="none", label="Impact interval"),
+    ]
+    fig.legend(handles=legend_handles, ncol=5, frameon=False,
+               loc="upper center", bbox_to_anchor=(.54, .995),
+               columnspacing=1.1, handlelength=2.4)
+    fig.subplots_adjust(left=.085, right=.995, bottom=.075, top=.88,
+                        wspace=.20, hspace=.18)
     save_figure(fig, out, "fig1_paired_time_histories")
 
 
@@ -207,36 +240,78 @@ def metric_row(d, method, condition, mu):
     }
 
 
-def grouped_metric_figure(rows, labels, out):
+def grouped_metric_figure(rows, labels, out, sifr_dropped):
     fig, axes = plt.subplots(2, 2, figsize=(7.16, 4.4))
     metrics = (("peak_external_N", "Measured disturbance peak [N]"),
                ("peak_internal_N", "Peak internal force [N]"),
                ("peak_friction_utilization", "Peak friction utilization"),
                ("peak_estimated_slip_mm", "Peak estimated slip [mm]"))
-    x = np.arange(len(labels)); width = 0.36
+    x = np.arange(len(labels))
     for ax, (key, ylabel) in zip(axes.flat, metrics):
         s = [next(r[key] for r in rows if r["condition"] == lab and r["method"] == "SIFR")
              for lab in labels]
         d = [next(r[key] for r in rows if r["condition"] == lab and r["method"] == "DIFR")
              for lab in labels]
-        ax.bar(x-width/2, s, width, color="white", edgecolor=BASELINE,
-               linewidth=1.0, hatch="///", label="SIFR")
-        ax.bar(x+width/2, d, width, color=PROPOSED, edgecolor=PROPOSED,
-               linewidth=0.8, label="DIFR")
+        # Paired dumbbell plot is visually lighter than bars and makes unfair
+        # disturbance matching immediately visible.
+        for xi, sv, dv in zip(x, s, d):
+            ax.plot([xi-.10, xi+.10], [sv, dv], color="#bdbdbd",
+                    linewidth=1.2, zorder=1)
+        ax.scatter(x-.10, s, s=34, facecolor="white", edgecolor=BASELINE,
+                   linewidth=1.3, marker="o", label="SIFR", zorder=3)
+        ax.scatter(x+.10, d, s=34, facecolor=PROPOSED, edgecolor=PROPOSED,
+                   linewidth=.8, marker="D", label="DIFR", zorder=3)
         ax.set_xticks(x, labels)
         ax.set_ylabel(ylabel)
         ax.margins(x=0.03)
         ax.grid(axis="y", color=GRID, linestyle="--", linewidth=.55)
         ax.set_axisbelow(True)
-        ax.legend(frameon=False)
+        ax.legend(frameon=False, ncol=2, loc="best")
         if key == "peak_friction_utilization":
             ax.axhline(1.0, color=DESIRED, linestyle=":", linewidth=1.0)
+        if key == "peak_estimated_slip_mm":
+            for xi, lab, value in zip(x, labels, s):
+                if lab in sifr_dropped:
+                    ax.annotate("Dropped", (xi-.10, value), xytext=(0, 7),
+                                textcoords="offset points", ha="center",
+                                color=BASELINE, fontsize=7.5, fontstyle="italic")
     titles = ("(a) Matched disturbance", "(b) Internal-force response",
               "(c) Friction-cone margin", "(d) Slip-state response")
     for ax, title in zip(axes.flat, titles):
         ax.set_title(title)
     fig.tight_layout(pad=.35, w_pad=.8, h_pad=.7)
     save_figure(fig, out, "fig2_cross_condition_metrics")
+
+
+def friction_margin_figure(pairs, labels, out, mu, before, after):
+    """Directly show remaining friction capacity; positive is safe."""
+    n = len(pairs)
+    fig, axes = plt.subplots(1, n, figsize=(7.16, 2.25), sharex=True,
+                             sharey=True, squeeze=False)
+    for col, ((sifr, difr), label) in enumerate(zip(pairs, labels)):
+        ax = axes[0, col]
+        ax.axhspan(0, 100, color="#edf6ed", zorder=0)
+        ax.axhspan(-100, 0, color="#f9e5e5", zorder=0)
+        for d, name, color, ls in ((difr, "DIFR", PROPOSED, "-"),
+                                    (sifr, "SIFR", BASELINE, "--")):
+            margin = mu*np.abs(d["internal"]) - d["external"]
+            d["friction_margin"] = margin
+            t, y = crop(d, "friction_margin", before, after)
+            ax.plot(t, y, color=color, linestyle=ls, label=name)
+        ax.axhline(0, color=DESIRED, linestyle=":", linewidth=1.0)
+        ax.axvline(0, color="#777777", linestyle=":", linewidth=.8)
+        ax.set_title(f"({chr(97+col)}) {label}")
+        style_axis(ax, before, after, xlabel=True)
+        if col == 0:
+            ax.set_ylabel(r"Margin $\mu F_I-|F_E|$ [N]")
+            ax.legend(frameon=False, loc="best")
+    # Apply finite shared bounds instead of the temporary +/-100 fill limits.
+    values = [mu*np.abs(d["internal"]) - d["external"] for pair in pairs for d in pair]
+    bound = max(.25, 1.10*max(float(np.nanmax(np.abs(v))) for v in values))
+    for ax in axes.flat:
+        ax.set_ylim(-bound, bound)
+    fig.tight_layout(pad=.35, w_pad=.55)
+    save_figure(fig, out, "fig3_friction_margin_time_history")
 
 
 def force_space_figure(pairs, labels, out, mu):
@@ -270,7 +345,7 @@ def force_space_figure(pairs, labels, out, mu):
             if row == 1:
                 ax.set_xlabel(r"Internal force $F_I$ [N]")
     fig.tight_layout(pad=.35, w_pad=.5, h_pad=.55)
-    save_figure(fig, out, "fig3_force_space_friction_cone")
+    save_figure(fig, out, "fig4_force_space_friction_cone")
 
 
 def main():
@@ -281,6 +356,8 @@ def main():
     ap.add_argument("--difr", nargs="+", required=True,
                     help="paired DIFR logs in the same order")
     ap.add_argument("--labels", nargs="+", help="condition labels, e.g. Low Medium High")
+    ap.add_argument("--sifr-dropped", nargs="*", default=[], metavar="LABEL",
+                    help="condition labels where the SIFR trial dropped the object")
     ap.add_argument("--mu", type=float, default=0.4)
     ap.add_argument("--mass", type=float, default=0.2)
     ap.add_argument("--nominal-force", type=float, default=3.0)
@@ -321,7 +398,8 @@ def main():
     for (s, d), label in zip(pairs, labels):
         rows.extend((metric_row(s, "SIFR", label, args.mu),
                      metric_row(d, "DIFR", label, args.mu)))
-    grouped_metric_figure(rows, labels, out)
+    grouped_metric_figure(rows, labels, out, set(args.sifr_dropped))
+    friction_margin_figure(pairs, labels, out, args.mu, args.before, args.after)
     force_space_figure(pairs, labels, out, args.mu)
 
     with open(out / "collision_metrics.csv", "w", newline="", encoding="utf-8") as f:
@@ -331,6 +409,12 @@ def main():
     theoretical = args.mass * 9.81 / (2.0 * args.mu)
     print(f"Theoretical per-contact minimum mg/(2mu) = {theoretical:.3f} N")
     print(f"Configured nominal internal force = {args.nominal_force:.3f} N")
+    logged_nominals = [float(np.median(d["desired"][d["relative_time"] < -0.2]))
+                       for pair in pairs for d in pair
+                       if np.any(d["relative_time"] < -0.2)]
+    if logged_nominals and abs(float(np.median(logged_nominals))-args.nominal_force) > .15:
+        print("[warning] --nominal-force differs from the logged pre-impact desired force: "
+              f"{np.median(logged_nominals):.3f} N")
     for (s, d), label in zip(pairs, labels):
         mismatch = abs(s["peak_external"]-d["peak_external"]) / max(
             0.5*(s["peak_external"]+d["peak_external"]), 1e-6)

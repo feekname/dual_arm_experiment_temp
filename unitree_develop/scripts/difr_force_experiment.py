@@ -152,7 +152,8 @@ class DIFRController:
                  delta_min=-0.05, delta_max=0.05,
                  collision_threshold=8.0, fc_threshold=0.8, K_f=0.002,
                  roll_offset_max=0.10, force_deadband=0.2,
-                 roll_offset_min=None):
+                 roll_offset_min=None, external_force_threshold=0.8,
+                 activation_hold_time=1.0):
         self.F_0 = F_0
         self.F_min = F_min
         self.F_max = F_max
@@ -164,6 +165,8 @@ class DIFRController:
         self.delta_max = delta_max
         self.collision_threshold = collision_threshold
         self.fc_threshold = fc_threshold
+        self.external_force_threshold = external_force_threshold
+        self.activation_hold_time = activation_hold_time
         self.K_f = K_f
         self.roll_offset_max = roll_offset_max
         self.roll_offset_min = (-roll_offset_max if roll_offset_min is None
@@ -174,6 +177,7 @@ class DIFRController:
         self.delta_dot = 0.0
         self.F_I_des = F_0
         self.active = False
+        self.activation_hold_remaining = 0.0
         self.roll_offset = 0.0
 
     def reset(self):
@@ -181,6 +185,7 @@ class DIFRController:
         self.delta_dot = 0.0
         self.F_I_des = self.F_0
         self.active = False
+        self.activation_hold_remaining = 0.0
         self.roll_offset = 0.0
 
     def update(self, F_E, F_I_est, gmo_force_norm, dt, dynamic_enabled=True):
@@ -194,11 +199,21 @@ class DIFRController:
         fc = force_demand / max(self.mu * self.F_I_des, 1e-6)
 
         collision = gmo_force_norm > self.collision_threshold
+        sensor_collision = force_demand > self.external_force_threshold
         slip = abs(self.delta) > 0.005 or abs(self.delta_dot) > 0.02
         friction_margin_low = fc > self.fc_threshold
-        # GRASP阶段只跟踪F0；完成GMO去偏后，TEST阶段才允许DIFR增力。
-        self.active = dynamic_enabled and (
-            collision or slip or friction_margin_low)
+        # 直接传感器触发适配轻量物体；保持计时避免阈值附近逐帧开关。
+        raw_trigger = collision or sensor_collision or slip or friction_margin_low
+        if dynamic_enabled:
+            if raw_trigger:
+                self.activation_hold_remaining = self.activation_hold_time
+            else:
+                self.activation_hold_remaining = max(
+                    0.0, self.activation_hold_remaining - dt)
+            self.active = raw_trigger or self.activation_hold_remaining > 0.0
+        else:
+            self.active = False
+            self.activation_hold_remaining = 0.0
 
         if self.active:
             # 标量化公式(41)：先求无约束最优解，再投影到全部可行区间。
@@ -207,10 +222,12 @@ class DIFRController:
             denom = self.alpha0 + self.alpha1 * k**2
             F_I_star = (self.alpha0 * self.F_0 + self.alpha1 * k * C) / denom
 
-            # δ_min <= C-kF <= δ_max，以及保守摩擦锥约束 fc<=fc_threshold。
+            # Eq. (41): δ边界、静态重力平衡和内力上下界。
             slip_lower = (C - self.delta_max) / k
-            friction_lower = force_demand / max(self.mu * self.fc_threshold, 1e-6)
-            feasible_lower = max(self.F_min, slip_lower, friction_lower)
+            gravity_lower = self.m_object * 9.81 / max(2.0*self.mu, 1e-6)
+            # F0在论文中定义为维持物体的最小标称内力；DIFR只能在其上
+            # 动态增力，不能因为瞬态QP解而把夹持力降到F0以下。
+            feasible_lower = max(self.F_min, self.F_0, slip_lower, gravity_lower)
             feasible_upper = self.F_max
             if feasible_lower <= feasible_upper:
                 F_I_des = np.clip(F_I_star, feasible_lower, feasible_upper)
@@ -391,6 +408,10 @@ def main():
     parser.add_argument('--delta-max', type=float, default=0.05)
     parser.add_argument('--fc-threshold', type=float, default=0.8)
     parser.add_argument('--collision-threshold', type=float, default=8.0)
+    parser.add_argument('--external-force-threshold', type=float, default=0.8,
+                        help='左手去偏切向力直接触发阈值(N)，适用于轻量物体')
+    parser.add_argument('--activation-hold-time', type=float, default=1.0,
+                        help='触发消失后保持DIFR激活的时间(s)，避免阈值附近抖动')
     parser.add_argument('--K-f', type=float, default=0.002,
                         help='roll模式的力误差积分增益，单位rad/(N*s)')
     parser.add_argument('--actuation-mode', choices=['roll', 'ik'], default='roll',
@@ -469,6 +490,8 @@ def main():
                            delta_min=args.delta_min, delta_max=args.delta_max,
                            fc_threshold=args.fc_threshold,
                            collision_threshold=args.collision_threshold,
+                           external_force_threshold=args.external_force_threshold,
+                           activation_hold_time=args.activation_hold_time,
                            K_f=force_gain,
                            roll_offset_max=action_max,
                            force_deadband=args.force_deadband,
