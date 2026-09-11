@@ -417,8 +417,8 @@ def main():
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
     if args.actuation_mode == 'ik':
-        if not (0.0 < args.ik_max_displacement <= 0.04):
-            parser.error('--ik-max-displacement必须在(0, 0.04] m内；更大位移需先重新仿真验证')
+        if not (0.0 < args.ik_max_displacement <= 0.015):
+            parser.error('--ik-max-displacement必须在(0, 0.015] m内；更大位移需先重新仿真验证')
         if args.ik_force_gain <= 0.0 or args.ik_joint_delta_max <= 0.0:
             parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
 
@@ -515,6 +515,7 @@ def main():
     data_file.write(f"# QP参数: F_0={args.F0}, F_min={args.F_min}, F_max={args.F_max}, mu={args.mu}, m_object={args.m_object}\n")
     data_file.write(f"# actuation_mode: {args.actuation_mode}\n")
     data_file.write(f"# action_offset_unit: {'m_total_closure' if args.actuation_mode == 'ik' else 'rad_total_roll'}\n")
+    data_file.write(f"# ik_max_displacement_per_hand_m: {args.ik_max_displacement}\n")
     data_file.write("# 列: time phase(0=MOVE,1=GRASP,2=TEST) "
                      "left_q(7) right_q(7) "
                      "left_gmo_F(3) right_gmo_F(3) "
@@ -522,7 +523,10 @@ def main():
                      "F_I_est(内力估计,N) F_E_gmo(GMO外力,N) F_E_sensor(传感器外力,N) "
                      "F_I_des(期望内力) delta(滑动位移) action_offset(执行偏移) "
                      "fc(摩擦锥裕度) difr_active "
-                     "force_left_6dof(6)\n")
+                     "force_left_6dof(6) "
+                     "actual_total_closure(m) closure_limit(m) "
+                     "left_joint_tracking_rmse(rad) right_joint_tracking_rmse(rad) "
+                     "sent_target_total_closure(m)\n")
     data_file.write("#" + "=" * 80 + "\n")
 
     print("\n" + "=" * 80)
@@ -541,6 +545,9 @@ def main():
     # 关节角增量限幅
     last_target_l = start_l.copy()
     last_target_r = start_r.copy()
+    # IK实际闭合量以GRASP首帧的真机姿态为零点。相对理论goal姿态的
+    # 原始FK值在MOVE阶段通常为负，不适合直接解释为执行器运动距离。
+    actual_closure_origin = None
 
     # GMO稳态偏置（GRASP阶段最后2秒采集，TEST阶段去除）
     gmo_bias_F_l = np.zeros(3)
@@ -562,6 +569,7 @@ def main():
         nonlocal last_time, last_print, record_count
         nonlocal gmo_bias_F_l, gmo_bias_F_r, gmo_bias_samples_l, gmo_bias_samples_r, gmo_bias_applied
         nonlocal last_target_l, last_target_r
+        nonlocal actual_closure_origin
 
         now = time.time()
         dt = now - last_time
@@ -587,6 +595,18 @@ def main():
         cur_r_dq = check_velocity_limits(cur_r_dq, dq_max)
 
         pb.update_states(cur_l_q, cur_r_q)
+        if ik_actuator is not None:
+            raw_actual_closure = ik_actuator.measure_total_closure(cur_l_q, cur_r_q)
+            if phase == 0:
+                actual_closure = np.nan
+            else:
+                if actual_closure_origin is None:
+                    actual_closure_origin = raw_actual_closure
+                    print(f"\n[IK] GRASP实际闭合量清零；相对理论goal的初始偏差="
+                          f"{1000*raw_actual_closure:+.2f}mm")
+                actual_closure = raw_actual_closure - actual_closure_origin
+        else:
+            actual_closure = np.nan
 
         # 左臂 GMO
         M_l, Cq_l, G_l = pb.compute_dynamics("left", cur_l_q, cur_l_dq)
@@ -651,6 +671,14 @@ def main():
         target_r = last_target_r + delta_r
         last_target_l = target_l.copy()
         last_target_r = target_r.copy()
+        left_tracking_rmse = float(np.sqrt(np.mean((target_l - cur_l_q)**2)))
+        right_tracking_rmse = float(np.sqrt(np.mean((target_r - cur_r_q)**2)))
+        if ik_actuator is not None and actual_closure_origin is not None:
+            sent_target_closure = (
+                ik_actuator.measure_total_closure(target_l, target_r) -
+                actual_closure_origin)
+        else:
+            sent_target_closure = np.nan
 
         # 发送控制指令
         server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
@@ -664,7 +692,10 @@ def main():
             [f_left_normal],
             [F_I_est, F_E, F_E_sensor],
             [F_I_des, delta, delta_roll, fc, 1.0 if difr_active else 0.0],
-            f_left_6d
+            f_left_6d,
+            [actual_closure,
+             action_max if args.actuation_mode == 'ik' else np.nan,
+             left_tracking_rmse, right_tracking_rmse, sent_target_closure]
         ])
         data_file.write(" ".join([f"{v:.6f}" for v in row]) + "\n")
         record_count += 1
@@ -674,13 +705,20 @@ def main():
             phase_str = ["MOVE", "GRASP", "TEST"][phase]
             active_str = "DIFR-ON" if difr_active else "difr-off"
             fc_str = f"fc={fc:.2f}" + ("!" if fc > 1.0 else "")
+            action_text = (f"closure cmd/sent/actual/limit="
+                           f"{1000*delta_roll:.1f}/{1000*sent_target_closure:.1f}/"
+                           f"{1000*actual_closure:.1f}/"
+                           f"{1000*action_max:.1f}mm "
+                           f"sat={'Y' if delta_roll >= 0.995*action_max else 'N'} "
+                           f"qerr={np.degrees(left_tracking_rmse):.2f}/"
+                           f"{np.degrees(right_tracking_rmse):.2f}deg"
+                           if args.actuation_mode == 'ik' else
+                           f"delta_roll={delta_roll:+.4f}rad")
             print(f"\r  t={exp_time:5.2f}s [{phase_str}] [{active_str}] | "
                   f"GMO={gmo_force:5.1f}N F_E={F_E:5.1f}N | "
                   f"F_I_des={F_I_des:5.1f} est={F_I_est:5.1f} | "
                   f"δ={delta:+.4f} {fc_str} | "
-                  f"{'closure' if args.actuation_mode == 'ik' else 'delta_roll'}="
-                  f"{delta_roll * (1000.0 if args.actuation_mode == 'ik' else 1.0):+.4f}"
-                  f"{'mm' if args.actuation_mode == 'ik' else 'rad'} | "
+                  f"{action_text} | "
                   f"左传感器 Fn={f_left_normal:5.1f} Ft={F_E_sensor:+5.1f}",
                   end="", flush=True)
             last_print = exp_time

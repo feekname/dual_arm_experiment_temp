@@ -63,6 +63,8 @@ class SymmetricNormalIKActuator:
         if distance < 1e-6:
             raise RuntimeError("left/right EE positions coincide; contact normal is undefined")
         normal /= distance
+        self.start_position = {side: start[side].copy() for side in ("left", "right")}
+        self.normal = normal.copy()
         target = {
             "left": start["left"] + normal * self.max_displacement,
             "right": start["right"] - normal * self.max_displacement,
@@ -152,3 +154,12 @@ class SymmetricNormalIKActuator:
         left = self.goal["left"] + ratio * (self.solution["left"] - self.goal["left"])
         right = self.goal["right"] + ratio * (self.solution["right"] - self.goal["right"])
         return left, right, ratio
+
+    def measure_total_closure(self, left_q, right_q):
+        """Return FK-measured two-hand closure relative to the nominal goal [m]."""
+        self.model.update_states(left_q, right_q)
+        left_position, _ = self._pose("left")
+        right_position, _ = self._pose("right")
+        left_closure = float((left_position - self.start_position["left"]) @ self.normal)
+        right_closure = -float((right_position - self.start_position["right"]) @ self.normal)
+        return left_closure + right_closure
