@@ -199,9 +199,8 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after,
             axes[row, col].axvline(0.0, color="#777777", linestyle=":", linewidth=0.8)
             if sifr.get("dropped", False):
                 drop_t = sifr["drop_time"]
-                axes[row, col].axvspan(drop_t, after, facecolor="#eeeeee",
-                                      edgecolor="#aaaaaa", hatch="////",
-                                      alpha=.55, linewidth=0, zorder=.2)
+                axes[row, col].axvline(drop_t, color=BASELINE,
+                                      linestyle="-.", linewidth=.9, zorder=3)
         if sifr.get("dropped", False):
             axes[0, col].text(sifr["drop_time"]+.04, .96, "Object dropped",
                               transform=axes[0, col].get_xaxis_transform(),
@@ -260,8 +259,8 @@ def time_history_figure(pairs, labels, out, mu, nominal, before, after,
         Patch(facecolor=COLLISION_FILL, edgecolor="none", label="Impact interval"),
     ]
     if any(s.get("dropped", False) for s, _ in pairs):
-        legend_handles.append(Patch(facecolor="#eeeeee", edgecolor="#aaaaaa",
-                                    hatch="////", label="Contact lost / dropped"))
+        legend_handles.append(Line2D([0], [0], color=BASELINE, linestyle="-.",
+                                     label="SIFR object dropped"))
     fig.legend(handles=legend_handles, ncol=5, frameon=False,
                loc="upper center", bbox_to_anchor=(.54, .995),
                columnspacing=1.1, handlelength=2.4)
@@ -363,9 +362,8 @@ def friction_margin_figure(pairs, labels, out, mu, before, after):
                 y[t >= d["drop_time"]] = np.nan
             ax.plot(t, y, color=color, linestyle=ls, label=name)
         if sifr.get("dropped", False):
-            ax.axvspan(sifr["drop_time"], after, facecolor="#eeeeee",
-                       edgecolor="#aaaaaa", hatch="////", alpha=.65,
-                       linewidth=0, zorder=.2)
+            ax.axvline(sifr["drop_time"], color=BASELINE,
+                       linestyle="-.", linewidth=.9, zorder=3)
             ax.text(sifr["drop_time"]+.04, .96, "contact lost",
                     transform=ax.get_xaxis_transform(), va="top", ha="left",
                     rotation=90, color=BASELINE, fontsize=7)
