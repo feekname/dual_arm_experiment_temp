@@ -119,16 +119,21 @@ class SIFRController:
     仍然估计滑动位移δ（用于记录对比），但不用于调节内力
     '''
     def __init__(self, F_fixed=16.35, mu=0.3, m_object=1.0, K_f=0.002,
-                 roll_offset_max=0.10, force_deadband=0.2,
-                 roll_offset_min=None):
+                 K_p=0.0, roll_offset_max=0.10, force_deadband=0.2,
+                 roll_offset_min=None, delta_min=0.0, delta_max=0.05,
+                 delta_dot_max=0.5):
         self.F_fixed = F_fixed
         self.mu = mu
         self.m_object = m_object
         self.K_f = K_f
+        self.K_p = K_p
         self.roll_offset_max = roll_offset_max
         self.roll_offset_min = (-roll_offset_max if roll_offset_min is None
                                 else roll_offset_min)
         self.force_deadband = force_deadband
+        self.delta_min = delta_min
+        self.delta_max = delta_max
+        self.delta_dot_max = delta_dot_max
         self.delta = 0.0
         self.delta_dot = 0.0
         self.roll_offset = 0.0
@@ -149,23 +154,36 @@ class SIFRController:
 
         # 估计滑动位移（开环，用于记录对比）
         force_demand = abs(F_E)
-        net_force = force_demand - self.mu * F_I_des
+        # 状态估计必须使用传感器实际实现的内力，而不是控制器期望值。
+        # 否则在真机跟踪滞后时会错误假设摩擦力已经建立。
+        available_friction = self.mu * max(float(F_I_est), 0.0)
+        net_force = force_demand - available_friction
         if self.delta_dot <= 0.0 and net_force <= 0.0:
             self.delta_dot = 0.0  # 静摩擦区：不允许“反向滑移”伪影
         else:
-            self.delta_dot = max(0.0, self.delta_dot + net_force / self.m_object * dt)
-        self.delta += self.delta_dot * dt
+            self.delta_dot = np.clip(
+                self.delta_dot + net_force / self.m_object * dt,
+                0.0, self.delta_dot_max)
+        self.delta = np.clip(
+            self.delta + self.delta_dot * dt, self.delta_min, self.delta_max)
         # 摩擦锥裕度
         fc = force_demand / max(self.mu * F_I_des, 1e-6)
 
-        # 简化力积分器：累计肩roll位置偏移，直到实测内力跟上期望值。
+        # PI闭合控制。比例项改善碰撞后的即时响应；最终发送仍经过
+        # 单帧关节变化限幅，因此不会把比例阶跃直接发送到真机。
         force_error = F_I_des - F_I_est
         if abs(force_error) < self.force_deadband:
             force_error = 0.0
-        self.roll_offset += self.K_f * force_error * dt
-        self.roll_offset = np.clip(
-            self.roll_offset, self.roll_offset_min, self.roll_offset_max)
-        delta_roll = self.roll_offset
+        integral_candidate = self.roll_offset + self.K_f * force_error * dt
+        command_unclipped = integral_candidate + self.K_p * force_error
+        delta_roll = float(np.clip(
+            command_unclipped, self.roll_offset_min, self.roll_offset_max))
+        # 条件积分抗饱和：误差继续把指令推向饱和端时暂停积分。
+        driving_further = ((command_unclipped > self.roll_offset_max and force_error > 0.0) or
+                           (command_unclipped < self.roll_offset_min and force_error < 0.0))
+        if not driving_further:
+            self.roll_offset = float(np.clip(
+                integral_candidate, self.roll_offset_min, self.roll_offset_max))
 
         return F_I_des, delta_roll, self.delta, fc, False
 
@@ -276,6 +294,44 @@ def check_velocity_limits(dq, dq_max=2.0):
     return np.clip(dq, -dq_max, dq_max)
 
 
+ARM_JOINT_NAMES = (
+    'shoulder_pitch', 'shoulder_roll', 'shoulder_yaw', 'elbow',
+    'wrist_roll', 'wrist_pitch', 'wrist_yaw')
+
+
+def joint_error_details(actual, goal):
+    error = np.asarray(actual, float) - np.asarray(goal, float)
+    index = int(np.argmax(np.abs(error)))
+    return (float(np.abs(error[index])), ARM_JOINT_NAMES[index],
+            float(error[index]))
+
+
+def update_position_bias(bias, error, dt, gain, bias_limit, deadband):
+    """Integral outer loop that still outputs position commands only."""
+    active_error = np.where(np.abs(error) > deadband, error, 0.0)
+    return np.clip(
+        bias + gain * active_error * float(np.clip(dt, 1e-4, 0.05)),
+        -bias_limit, bias_limit)
+
+
+def joint_delta_limit_for_phase(phase, actuation_mode, joint_delta_max,
+                                ik_joint_delta_max, dt,
+                                move_joint_speed_max):
+    """Return the command slew limit for the current experiment phase.
+
+    The tighter IK limit protects force-driven closure in GRASP/TEST only.
+    Applying it during MOVE can prevent the arms from reaching the requested
+    preparation pose when the outer loop runs below its nominal frequency.
+    """
+    if phase == 0:
+        # joint_delta_max原本按100 Hz设计；改为速度限幅后，即使动力学
+        # 计算使外层循环降频，MOVE的允许速度也不再随循环频率下降。
+        return move_joint_speed_max * float(np.clip(dt, 1e-4, 0.05))
+    if actuation_mode == 'ik':
+        return min(joint_delta_max, ik_joint_delta_max)
+    return joint_delta_max
+
+
 # ================================================================
 # 主函数
 # ================================================================
@@ -284,6 +340,20 @@ def main():
     parser.add_argument('--left_q', type=float, nargs=7, required=True)
     parser.add_argument('--right_q', type=float, nargs=7, required=True)
     parser.add_argument('--move-time', type=float, default=10.0)
+    parser.add_argument('--move-settle-time', type=float, default=0.5,
+                        help='MOVE结束后等待真机稳定再锁定实际参考姿态(s)')
+    parser.add_argument('--move-joint-speed-max', type=float, default=0.8,
+                        help='MOVE阶段单关节最大命令速度(rad/s)')
+    parser.add_argument('--move-convergence-timeout', type=float, default=5.0,
+                        help='规划结束后继续沿相同控制路径等待到位的超时(s)')
+    parser.add_argument('--move-goal-tolerance', type=float, default=0.05,
+                        help='进入GRASP前允许的最大单关节到位误差(rad)')
+    parser.add_argument('--move-position-ki', type=float, default=0.8,
+                        help='MOVE终点纯位置外环积分增益(1/s)，设0可关闭')
+    parser.add_argument('--move-position-bias-max', type=float, default=0.08,
+                        help='外环积分允许附加到位置命令的最大偏置(rad)')
+    parser.add_argument('--move-position-deadband', type=float, default=0.003,
+                        help='停止积分的位置误差死区(rad)')
     parser.add_argument('--grasp-time', type=float, default=10.0)
     parser.add_argument('--test-time', type=float, default=30.0)
     parser.add_argument('--interface', type=str, default='eth0')
@@ -318,6 +388,14 @@ def main():
                         help='IK模式每只手最大法向位移(m)，两手总闭合量为其2倍')
     parser.add_argument('--ik-force-gain', type=float, default=0.0002,
                         help='IK模式力误差积分增益，单位m/(N*s)')
+    parser.add_argument('--force-kp', type=float, default=0.0,
+                        help='roll模式力误差比例增益，单位rad/N')
+    parser.add_argument('--ik-force-kp', type=float, default=0.0001,
+                        help='IK模式力误差比例增益，单位m/N；发送端仍有逐帧限幅')
+    parser.add_argument('--delta-min', type=float, default=0.0)
+    parser.add_argument('--delta-max', type=float, default=0.05)
+    parser.add_argument('--delta-dot-max', type=float, default=0.5,
+                        help='滑移状态速度上限(m/s)，仅为估计器防发散')
     parser.add_argument('--ik-damping', type=float, default=0.04)
     parser.add_argument('--ik-iterations', type=int, default=160)
     parser.add_argument('--ik-max-step', type=float, default=0.005,
@@ -330,10 +408,18 @@ def main():
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
     if args.actuation_mode == 'ik':
-        if not (0.0 < args.ik_max_displacement <= 0.015):
-            parser.error('--ik-max-displacement必须在(0, 0.015] m内；更大位移需先重新仿真验证')
-        if args.ik_force_gain <= 0.0 or args.ik_joint_delta_max <= 0.0:
+        if not (0.0 < args.ik_max_displacement <= 0.03):
+            parser.error('--ik-max-displacement必须在(0, 0.03] m内；更大位移需先重新仿真验证')
+        if args.ik_force_gain <= 0.0 or args.ik_force_kp < 0.0 or args.ik_joint_delta_max <= 0.0:
             parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
+    if args.delta_max <= args.delta_min or args.delta_dot_max <= 0.0:
+        parser.error('--delta-max必须大于--delta-min，且--delta-dot-max必须为正数')
+    if (args.move_settle_time < 0.0 or args.move_joint_speed_max <= 0.0 or
+            args.move_convergence_timeout <= 0.0 or
+            args.move_goal_tolerance <= 0.0 or args.move_position_ki < 0.0 or
+            args.move_position_bias_max <= 0.0 or
+            args.move_position_deadband < 0.0):
+        parser.error('MOVE稳定时间不能为负，速度、到位超时和容差必须为正数')
 
     print("=" * 80)
     print("  SIFR 双臂协作搬运实验 (力传感器版本, 对比实验)")
@@ -374,23 +460,26 @@ def main():
     action_max = (2.0 * args.ik_max_displacement
                   if args.actuation_mode == 'ik' else args.roll_offset_max)
     force_gain = args.ik_force_gain if args.actuation_mode == 'ik' else args.K_f
+    force_kp = args.ik_force_kp if args.actuation_mode == 'ik' else args.force_kp
     sifr = SIFRController(F_fixed=args.F_fixed, mu=args.mu,
-                           m_object=args.m_object, K_f=force_gain,
+                           m_object=args.m_object, K_f=force_gain, K_p=force_kp,
                            roll_offset_max=action_max,
                            force_deadband=args.force_deadband,
-                           roll_offset_min=(0.0 if args.actuation_mode == 'ik' else None))
+                           roll_offset_min=(0.0 if args.actuation_mode == 'ik' else None),
+                           delta_min=args.delta_min, delta_max=args.delta_max,
+                           delta_dot_max=args.delta_dot_max)
 
     goal_l = np.array(args.left_q)
     goal_r = np.array(args.right_q)
+    if (np.any(goal_l < q_min) or np.any(goal_l > q_max) or
+            np.any(goal_r < q_min) or np.any(goal_r > q_max)):
+        parser.error('MOVE目标超出实验代码的关节安全限位')
+    print("[MOVE目标] 关节顺序: " + " ".join(ARM_JOINT_NAMES))
+    print("[MOVE目标] 左臂: " + " ".join(f"{v:+.3f}" for v in goal_l))
+    print("[MOVE目标] 右臂: " + " ".join(f"{v:+.3f}" for v in goal_r))
     ik_actuator = None
-    if args.actuation_mode == 'ik':
-        ik_actuator = SymmetricNormalIKActuator(
-            pb, goal_l, goal_r,
-            max_displacement=args.ik_max_displacement,
-            damping=args.ik_damping,
-            iterations=args.ik_iterations,
-            max_step=args.ik_max_step,
-            q_min=q_min, q_max=q_max)
+    # IK必须在MOVE结束后以真机实际到达姿态建立。此处不能使用理论goal，
+    # 否则cmd/limit与sent/actual会落在两个不同的零点上。
 
     print(f"\n[初始化] 连接 G1...")
     server = G1Server(network_interface=args.interface, shm_name=args.shm_name)
@@ -423,6 +512,13 @@ def main():
     data_file.write(f"# actuation_mode: {args.actuation_mode}\n")
     data_file.write(f"# action_offset_unit: {'m_total_closure' if args.actuation_mode == 'ik' else 'rad_total_roll'}\n")
     data_file.write(f"# ik_max_displacement_per_hand_m: {args.ik_max_displacement}\n")
+    data_file.write(f"# force_PI: Ki={force_gain}, Kp={force_kp}; "
+                    f"delta_limits=[{args.delta_min},{args.delta_max}], "
+                    f"delta_dot_max={args.delta_dot_max}\n")
+    data_file.write(
+        f"# MOVE纯位置外环: Ki={args.move_position_ki}, "
+        f"bias_max={args.move_position_bias_max}rad, "
+        f"deadband={args.move_position_deadband}rad, torque_ff=0\n")
     data_file.write("# 列: time phase(0=MOVE,1=GRASP,2=TEST) "
                      "left_q(7) right_q(7) "
                      "left_gmo_F(3) right_gmo_F(3) "
@@ -455,6 +551,9 @@ def main():
     # IK实际闭合量以GRASP首帧的真机姿态为零点。相对理论goal姿态的
     # 原始FK值在MOVE阶段通常为负，不适合直接解释为执行器运动距离。
     actual_closure_origin = None
+    sent_closure_origin = None
+    move_position_bias_l = np.zeros(7)
+    move_position_bias_r = np.zeros(7)
 
     # GMO稳态偏置
     gmo_bias_F_l = np.zeros(3)
@@ -480,11 +579,13 @@ def main():
         else:
             return 2
 
-    def run_one_step(exp_time, target_l, target_r):
+    def run_one_step(exp_time, target_l, target_r,
+                     move_integral_enabled=False):
         nonlocal last_time, last_print, record_count
         nonlocal gmo_bias_F_l, gmo_bias_F_r, gmo_bias_samples_l, gmo_bias_samples_r, gmo_bias_applied
         nonlocal last_target_l, last_target_r
         nonlocal actual_closure_origin
+        nonlocal move_position_bias_l, move_position_bias_r
         nonlocal tangent_bias, tangent_bias_applied, test_dynamic_state_reset
         nonlocal test_external_peak_abs, test_external_peak_signed
 
@@ -492,6 +593,8 @@ def main():
         dt = now - last_time
         last_time = now
         phase = get_phase(exp_time)
+        requested_target_l = target_l.copy()
+        requested_target_r = target_r.copy()
 
         # 读取力传感器
         raw_force = force_reader.read_force()
@@ -594,6 +697,28 @@ def main():
             fc = 0.0
             active = False
 
+        # 纯位置外环积分：只在MOVE最终目标保持阶段学习静差补偿。
+        # GRASP/TEST沿用该位置偏置，但motor_cmd.tau始终保持为零。
+        if phase == 0 and move_integral_enabled:
+            move_position_bias_l = update_position_bias(
+                move_position_bias_l, requested_target_l - cur_l_q, dt,
+                args.move_position_ki, args.move_position_bias_max,
+                args.move_position_deadband)
+            move_position_bias_r = update_position_bias(
+                move_position_bias_r, requested_target_r - cur_r_q, dt,
+                args.move_position_ki, args.move_position_bias_max,
+                args.move_position_deadband)
+            target_l = requested_target_l + move_position_bias_l
+            target_r = requested_target_r + move_position_bias_r
+        elif phase >= 1:
+            target_l = target_l + move_position_bias_l
+            target_r = target_r + move_position_bias_r
+
+        # 本帧希望发送的纯位置命令（含外环偏置）。request_gap只统计
+        # 后续关节限位或速度限制造成的未发送部分。
+        command_request_l = target_l.copy()
+        command_request_r = target_r.copy()
+
         # 关节角限位
         target_l = check_joint_limits(target_l, q_min, q_max)
         target_r = check_joint_limits(target_r, q_min, q_max)
@@ -601,27 +726,36 @@ def main():
         # 关节角增量限幅
         delta_l = target_l - last_target_l
         delta_r = target_r - last_target_r
-        frame_limit = (min(args.joint_delta_max, args.ik_joint_delta_max)
-                       if args.actuation_mode == 'ik' else args.joint_delta_max)
+        frame_limit = joint_delta_limit_for_phase(
+            phase, args.actuation_mode,
+            args.joint_delta_max, args.ik_joint_delta_max,
+            dt, args.move_joint_speed_max)
         delta_l = np.clip(delta_l, -frame_limit, frame_limit)
         delta_r = np.clip(delta_r, -frame_limit, frame_limit)
         target_l = last_target_l + delta_l
         target_r = last_target_r + delta_r
+        request_gap = max(
+            float(np.max(np.abs(command_request_l - target_l))),
+            float(np.max(np.abs(command_request_r - target_r))))
         last_target_l = target_l.copy()
         last_target_r = target_r.copy()
+        left_goal_rmse = float(np.sqrt(np.mean(
+            (requested_target_l - cur_l_q)**2)))
+        right_goal_rmse = float(np.sqrt(np.mean(
+            (requested_target_r - cur_r_q)**2)))
         left_tracking_rmse = float(np.sqrt(np.mean((target_l - cur_l_q)**2)))
         right_tracking_rmse = float(np.sqrt(np.mean((target_r - cur_r_q)**2)))
-        if ik_actuator is not None and actual_closure_origin is not None:
+        if ik_actuator is not None and sent_closure_origin is not None:
             sent_target_closure = (
                 ik_actuator.measure_total_closure(target_l, target_r) -
-                actual_closure_origin)
+                sent_closure_origin)
         else:
             sent_target_closure = np.nan
 
         # 发送控制指令
         server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
                                      [0.0]*7, [0.0]*7)
-            
+
 
         # 记录
         row = np.concatenate([
@@ -643,10 +777,20 @@ def main():
         if exp_time - last_print >= 0.1:
             phase_str = ["MOVE", "GRASP", "TEST"][phase]
             fc_str = f"fc={fc:.2f}" + ("!" if fc > 1.0 else "")
-            action_text = (f"closure cmd/sent/actual/limit="
+            action_text = (f"MOVE loop={1.0/max(dt, 1e-6):.1f}Hz "
+                           f"step_limit={frame_limit:.4f}rad "
+                           f"request_gap={request_gap:.4f}rad "
+                           f"I-bias={max(np.max(np.abs(move_position_bias_l)), np.max(np.abs(move_position_bias_r))):.4f}rad "
+                           f"goal_err={np.degrees(left_goal_rmse):.2f}/"
+                           f"{np.degrees(right_goal_rmse):.2f}deg "
+                           f"cmd_track={np.degrees(left_tracking_rmse):.2f}/"
+                           f"{np.degrees(right_tracking_rmse):.2f}deg"
+                           if phase == 0 else
+                           f"closure cmd/sent/actual/limit="
                            f"{1000*delta_roll:.1f}/{1000*sent_target_closure:.1f}/"
                            f"{1000*actual_closure:.1f}/"
                            f"{1000*action_max:.1f}mm "
+                           f"lag={1000*(sent_target_closure-actual_closure):+.1f}mm "
                            f"sat={'Y' if delta_roll >= 0.995*action_max else 'N'} "
                            f"qerr={np.degrees(left_tracking_rmse):.2f}/"
                            f"{np.degrees(right_tracking_rmse):.2f}deg"
@@ -672,14 +816,94 @@ def main():
         move_start = time.time()
         while True:
             elapsed = time.time() - move_start
-            exp_time = time.time() - exp_start
             if elapsed >= args.move_time:
                 break
-            target_l = quintic_interpolate(start_l, goal_l, elapsed, args.move_time)
-            target_r = quintic_interpolate(start_r, goal_r, elapsed, args.move_time)
-            run_one_step(exp_time, target_l.copy(), target_r.copy())
+            target_l = quintic_interpolate(
+                start_l, goal_l, elapsed, args.move_time)
+            target_r = quintic_interpolate(
+                start_r, goal_r, elapsed, args.move_time)
+            run_one_step(elapsed, target_l.copy(), target_r.copy())
             time.sleep(t_step)
-        print(f"\n[阶段1] 到达预备姿态")
+
+        # 仍使用与GRASP/TEST相同的run_one_step下发链路。先在最终目标
+        # 上保持move_settle_time，再进入额外的到位超时判断；旧时序把
+        # settle放在验收之后，导致用户设置的稳定时间根本没有执行。
+        move_phase_time = max(0.0, args.move_time - 1e-6)
+        if args.move_settle_time > 0.0:
+            print(f"\n[阶段1] 保持最终目标稳定 {args.move_settle_time:.2f}s...")
+            settle_start = time.time()
+            while time.time() - settle_start < args.move_settle_time:
+                run_one_step(move_phase_time, goal_l.copy(), goal_r.copy(),
+                             move_integral_enabled=True)
+                time.sleep(t_step)
+
+        convergence_start = time.time()
+        while True:
+            run_one_step(move_phase_time, goal_l.copy(), goal_r.copy(),
+                         move_integral_enabled=True)
+            current_move = server.manager.get_current_arm_states()
+            move_error_l, move_joint_l, move_signed_l = joint_error_details(
+                current_move["left_q"], goal_l)
+            move_error_r, move_joint_r, move_signed_r = joint_error_details(
+                current_move["right_q"], goal_r)
+            if max(move_error_l, move_error_r) <= args.move_goal_tolerance:
+                break
+            if time.time() - convergence_start >= args.move_convergence_timeout:
+                raise RuntimeError(
+                    f"MOVE到位超时: L {move_joint_l}={move_signed_l:+.4f}rad, "
+                    f"R {move_joint_r}={move_signed_r:+.4f}rad；"
+                    f"最大I-bias={max(np.max(np.abs(move_position_bias_l)), np.max(np.abs(move_position_bias_r))):.4f}rad；"
+                    "request_gap为0时表示含补偿的位置命令已完整发送")
+            time.sleep(t_step)
+
+        # 补偿额外到位等待，使GRASP的实验时间仍从move_time开始。
+        exp_start = time.time() - args.move_time
+        rebase_start = time.time()
+        print(f"\n[阶段1] 已通过实验主循环到达预备姿态")
+
+        # 锁定MOVE结束后的真机实际姿态，作为GRASP和TEST共同参考零位。
+        reference = server.manager.get_current_arm_states()
+        hold_l = np.array(reference["left_q"])
+        hold_r = np.array(reference["right_q"])
+        move_error_l, move_joint_l, move_signed_l = joint_error_details(
+            hold_l, goal_l)
+        move_error_r, move_joint_r, move_signed_r = joint_error_details(
+            hold_r, goal_r)
+        print(f"[阶段1] 最大关节到位误差: "
+              f"L {move_joint_l}={move_signed_l:+.4f}rad, "
+              f"R {move_joint_r}={move_signed_r:+.4f}rad")
+        if max(move_error_l, move_error_r) > args.move_goal_tolerance:
+            raise RuntimeError(
+                "MOVE实际姿态未到达指定位置，拒绝用错误姿态建立IK零点；"
+                "请检查底层控制权、关节跟踪或适当增加--move-settle-time")
+        print(f"[阶段1] 学得纯位置偏置: "
+              f"L={move_position_bias_l.tolist()}, "
+              f"R={move_position_bias_r.tolist()}")
+        sifr.reset()
+        if args.actuation_mode == 'ik':
+            ik_actuator = SymmetricNormalIKActuator(
+                pb, hold_l, hold_r,
+                max_displacement=args.ik_max_displacement,
+                damping=args.ik_damping,
+                iterations=args.ik_iterations,
+                max_step=args.ik_max_step,
+                q_min=q_min, q_max=q_max)
+            actual_closure_origin = ik_actuator.measure_total_closure(hold_l, hold_r)
+            biased_hold_l = check_joint_limits(
+                hold_l + move_position_bias_l, q_min, q_max)
+            biased_hold_r = check_joint_limits(
+                hold_r + move_position_bias_r, q_min, q_max)
+            sent_closure_origin = ik_actuator.measure_total_closure(
+                biased_hold_l, biased_hold_r)
+        data_file.write("# actual_reference_left_q: " +
+                        " ".join(f"{v:.8f}" for v in hold_l) + "\n")
+        data_file.write("# actual_reference_right_q: " +
+                        " ".join(f"{v:.8f}" for v in hold_r) + "\n")
+        print("[参考零位] 已使用MOVE结束真机姿态重建控制参考；"
+              "cmd/sent/actual从同一零点开始")
+        # IK求解属于阶段切换准备，不计入GRASP时长，也不能形成一个大dt。
+        exp_start += time.time() - rebase_start
+        last_time = time.time()
 
         # 阶段2: GRASP
         print(f"\n[阶段2] 保持姿态，GMO去偏采集 ({args.grasp_time}s)...")
@@ -689,7 +913,7 @@ def main():
             exp_time = time.time() - exp_start
             if elapsed >= args.grasp_time:
                 break
-            run_one_step(exp_time, goal_l.copy(), goal_r.copy())
+            run_one_step(exp_time, hold_l.copy(), hold_r.copy())
             time.sleep(t_step)
         print(f"\n[阶段2] 完成")
 
@@ -701,7 +925,7 @@ def main():
             exp_time = time.time() - exp_start
             if elapsed >= args.test_time:
                 break
-            run_one_step(exp_time, goal_l.copy(), goal_r.copy())
+            run_one_step(exp_time, hold_l.copy(), hold_r.copy())
             time.sleep(t_step)
         print(f"\n[阶段3] 测试完成")
         smooth_peak = (float(np.max(np.convolve(

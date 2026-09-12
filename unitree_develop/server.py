@@ -7,7 +7,7 @@ from manager import G1DualArmManager
 from shm_handler import ForceSensorReader
 
 class G1Server:
-    def __init__(self, network_interface: str, shm_name: str = "/dev/shm/6_axis_force_shm"):
+    def __init__(self, network_interface: str, shm_name: str = "6_axis_force_shm"):
         self.config = ArmConfig()
         self.manager = G1DualArmManager(self.config)
         # self.sensor = ForceSensorReader(shm_name)
@@ -51,7 +51,10 @@ class G1Server:
         
         # 1. 锁定当前状态
         current = self.manager.get_current_arm_states()
-        self.manager.set_arm_poses(current["left_q"], current["right_q"])
+        self.manager.set_arm_poses(
+            current["left_q"], current["right_q"],
+            [0.0] * 7, [0.0] * 7
+        )
         self.emergency_locked = True
         print("[Server] 机器人已锁定在当前位置。")
 
@@ -115,11 +118,11 @@ class G1Server:
             # print(interp_r)
             # print('\n')
             # 实时更新目标
-            self.manager.set_arm_poses(interp_l, interp_r)
+            self.manager.set_arm_poses(interp_l, interp_r, [0.0] * 7, [0.0] * 7)
             time.sleep(0.01)
 
         if not self._stop_event.is_set():
-            self.manager.set_arm_poses(left_goal, right_goal)
+            self.manager.set_arm_poses(left_goal, right_goal, [0.0] * 7, [0.0] * 7)
 
     def move_arm_to_sync_quintic(self, left_goal: List[float], right_goal: List[float], duration: float):
         """
@@ -169,7 +172,9 @@ class G1Server:
             interp_r = start_r + (goal_r - start_r) * s_t
         
             # 6. 下发指令 (直接转成 list)
-            self.manager.set_arm_poses(interp_l.tolist(), interp_r.tolist())
+            self.manager.set_arm_poses(
+                interp_l.tolist(), interp_r.tolist(), [0.0] * 7, [0.0] * 7
+            )
         
             # 7. 动态休眠：确保循环频率严格稳定在 100Hz
             next_tick += control_dt
@@ -179,7 +184,7 @@ class G1Server:
 
         # 8. 确保最终精准到达目标点
         if not self._stop_event.is_set():
-            self.manager.set_arm_poses(left_goal, right_goal)
+            self.manager.set_arm_poses(left_goal, right_goal, [0.0] * 7, [0.0] * 7)
         print("[Server] 运动任务完成")
 
 
@@ -189,4 +194,4 @@ class G1Server:
             # state["force_sensor"] = self.sensor.read_force()
             for sub in self._subscribers:
                 sub(state)
-            time.sleep(0.01)
+            time.sleep(0.005)

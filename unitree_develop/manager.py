@@ -72,7 +72,9 @@ class G1DualArmManager:
             self.driver.low_cmd.motor_cmd[idx].dq = self.target_dq[idx] # 搬运任务通常设为0，由内环控制速度
             self.driver.low_cmd.motor_cmd[idx].kp = self.config.kp
             self.driver.low_cmd.motor_cmd[idx].kd = self.config.kd
-            # self.driver.low_cmd.motor_cmd[idx].tau = self.target_tau_ff[idx]
+            # 本项目当前使用纯位置控制：显式清零，避免命令缓冲区残留
+            # 任何历史前馈力矩。静差由上层位置命令偏置消除。
+            self.driver.low_cmd.motor_cmd[idx].tau = 0.0
 
         # 3. 发布指令
         self.driver.publish_cmd()
