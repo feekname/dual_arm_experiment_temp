@@ -262,13 +262,10 @@ class DualArmPyBullet:
         Cq_full = np.array(p.calculateInverseDynamics(self.robot_id, full_q.tolist(), full_dq.tolist(), zero)) - G_full
         G = G_full[pos]
         Cq = Cq_full[pos]
-        M = []
-        for k in range(7):
-            aa = np.zeros(self.n_total)
-            aa[pos[k]] = 1.0
-            T_full = np.array(p.calculateInverseDynamics(self.robot_id, full_q.tolist(), zero, aa.tolist())) - G_full
-            M.append(T_full[pos])
-        return np.array(M).T, Cq, G
+        M_full = np.asarray(p.calculateMassMatrix(
+            self.robot_id, full_q.tolist()), dtype=float)
+        M = M_full[np.ix_(pos, pos)]
+        return M, Cq, G
 
     def compute_jacobian(self, arm, q, dq):
         full_q, full_dq = self._build_full(arm, q, dq)
@@ -292,6 +289,31 @@ def quintic_interpolate(start, goal, t, duration):
 
 def check_joint_limits(q, q_min, q_max):
     return np.clip(q, q_min, q_max)
+
+
+class FixedRateScheduler:
+    """Absolute-deadline scheduler; avoids adding 10 ms after computation."""
+
+    def __init__(self, rate_hz):
+        self.period = 1.0 / float(rate_hz)
+        self.next_tick = time.perf_counter()
+        self.overruns = 0
+        self.max_lateness = 0.0
+
+    def reset(self):
+        self.next_tick = time.perf_counter()
+
+    def wait(self):
+        self.next_tick += self.period
+        remaining = self.next_tick - time.perf_counter()
+        if remaining > 0.0:
+            time.sleep(remaining)
+            return
+        lateness = -remaining
+        self.overruns += 1
+        self.max_lateness = max(self.max_lateness, lateness)
+        if lateness >= self.period:
+            self.next_tick = time.perf_counter()
 
 def check_velocity_limits(dq, dq_max=2.0):
     return np.clip(dq, -dq_max, dq_max)
@@ -361,6 +383,14 @@ def main():
     parser.add_argument('--test-time', type=float, default=30.0)
     parser.add_argument('--interface', type=str, default='eth0')
     parser.add_argument('--gmo-gain', type=float, default=15.0)
+    parser.add_argument('--control-rate', type=float, default=100.0,
+                        help='力传感器/控制/指令更新频率(Hz)，默认100')
+    parser.add_argument('--gmo-rate', type=float, default=0.0,
+                        help='GMO动力学更新频率(Hz)；0关闭以保证100Hz')
+    parser.add_argument('--print-rate', type=float, default=5.0,
+                        help='终端诊断刷新频率(Hz)；0关闭')
+    parser.add_argument('--kinematics-rate', type=float, default=20.0,
+                        help='仅用于日志的FK闭合量计算频率(Hz)；不影响100Hz控制')
     # 力传感器参数
     parser.add_argument('--shm-name', type=str, default='6_axis_force_shm')
     parser.add_argument('--shm-backend', choices=['sysv', 'posix'], default='sysv',
@@ -428,6 +458,11 @@ def main():
             args.move_position_bias_max <= 0.0 or
             args.move_position_deadband < 0.0):
         parser.error('MOVE稳定时间不能为负，速度、到位超时和容差必须为正数')
+    if (args.control_rate <= 0.0 or args.gmo_rate < 0.0 or
+            args.gmo_rate > args.control_rate or args.print_rate < 0.0 or
+            args.kinematics_rate <= 0.0 or
+            args.kinematics_rate > args.control_rate):
+        parser.error('control-rate必须为正；gmo/kinematics-rate不能超过控制频率；print-rate不能为负')
 
     print("=" * 80)
     print("  SIFR 双臂协作搬运实验 (力传感器版本, 对比实验)")
@@ -442,6 +477,9 @@ def main():
         print(f"  [警告] F_fixed低于重力静态下界，物体可能持续滑移")
     print(f"  力传感器共享内存: {args.shm_name}")
     print(f"  执行方式: {args.actuation_mode.upper()}")
+    print(f"  上层实时控制: {args.control_rate:.1f}Hz | "
+          f"GMO: {'关闭' if args.gmo_rate == 0 else f'{args.gmo_rate:.1f}Hz'} | "
+          f"FK诊断: {args.kinematics_rate:.1f}Hz")
     print("=" * 80)
 
     if args.output:
@@ -523,6 +561,10 @@ def main():
     data_file.write(f"# 阶段: MOVE={args.move_time}s, GRASP={args.grasp_time}s, TEST={args.test_time}s\n")
     data_file.write(f"# 参数: F_fixed={args.F_fixed}, mu={args.mu}, m_object={args.m_object}\n")
     data_file.write(f"# actuation_mode: {args.actuation_mode}\n")
+    data_file.write(f"# timing: control_rate={args.control_rate}Hz, "
+                    f"gmo_rate={args.gmo_rate}Hz, "
+                    f"kinematics_rate={args.kinematics_rate}Hz, "
+                    f"print_rate={args.print_rate}Hz\n")
     data_file.write(f"# action_offset_unit: {'m_total_closure' if args.actuation_mode == 'ik' else 'rad_total_roll'}\n")
     data_file.write(f"# ik_max_displacement_per_hand_m: {args.ik_max_displacement}\n")
     data_file.write(f"# force_PI: Ki={force_gain}, Kp={force_kp}; "
@@ -550,11 +592,18 @@ def main():
     print("  实验开始")
     print("=" * 80)
 
-    t_step = 0.01
+    scheduler = FixedRateScheduler(args.control_rate)
     exp_start = time.time()
     last_print = 0.0
     record_count = 0
-    last_time = time.time()
+    last_time = time.perf_counter()
+    last_gmo_time = last_time
+    last_kinematics_time = -np.inf
+    cached_F_l = np.zeros(3)
+    cached_F_r = np.zeros(3)
+    cached_actual_closure = np.nan
+    cached_sent_target_closure = np.nan
+    loop_dt_history = []
     gmo_left.reset()
     gmo_right.reset()
     sifr.reset()
@@ -602,10 +651,15 @@ def main():
         nonlocal move_position_bias_l, move_position_bias_r
         nonlocal tangent_bias, tangent_bias_applied, test_dynamic_state_reset
         nonlocal test_external_peak_abs, test_external_peak_signed
+        nonlocal last_gmo_time, last_kinematics_time
+        nonlocal cached_F_l, cached_F_r
+        nonlocal cached_actual_closure, cached_sent_target_closure
 
-        now = time.time()
+        now = time.perf_counter()
         dt = now - last_time
         last_time = now
+        if 0.0 < dt < 0.2:
+            loop_dt_history.append(dt)
         phase = get_phase(exp_time)
         requested_target_l = target_l.copy()
         requested_target_r = target_r.copy()
@@ -628,31 +682,37 @@ def main():
         cur_l_dq = check_velocity_limits(cur_l_dq, dq_max)
         cur_r_dq = check_velocity_limits(cur_r_dq, dq_max)
 
-        pb.update_states(cur_l_q, cur_r_q)
-        if ik_actuator is not None:
+        update_kinematics = (
+            now - last_kinematics_time >= 1.0 / args.kinematics_rate)
+        if ik_actuator is not None and update_kinematics:
+            last_kinematics_time = now
             raw_actual_closure = ik_actuator.measure_total_closure(cur_l_q, cur_r_q)
             if phase == 0:
-                actual_closure = np.nan
+                cached_actual_closure = np.nan
             else:
                 if actual_closure_origin is None:
                     actual_closure_origin = raw_actual_closure
                     print(f"\n[IK] GRASP实际闭合量清零；相对理论goal的初始偏差="
                           f"{1000*raw_actual_closure:+.2f}mm")
-                actual_closure = raw_actual_closure - actual_closure_origin
-        else:
-            actual_closure = np.nan
+                cached_actual_closure = raw_actual_closure - actual_closure_origin
+        actual_closure = cached_actual_closure if ik_actuator is not None else np.nan
 
-        # 左臂 GMO
-        M_l, Cq_l, G_l = pb.compute_dynamics("left", cur_l_q, cur_l_dq)
-        r_l = gmo_left.update(M_l, Cq_l, G_l, cur_l_tau, cur_l_dq, dt)
-        J_l = pb.compute_jacobian("left", cur_l_q, cur_l_dq)
-        F_l = np.linalg.pinv(J_l.T) @ r_l
-
-        # 右臂 GMO
-        M_r, Cq_r, G_r = pb.compute_dynamics("right", cur_r_q, cur_r_dq)
-        r_r = gmo_right.update(M_r, Cq_r, G_r, cur_r_tau, cur_r_dq, dt)
-        J_r = pb.compute_jacobian("right", cur_r_q, cur_r_dq)
-        F_r = np.linalg.pinv(J_r.T) @ r_r
+        update_gmo = (args.gmo_rate > 0.0 and
+                      now - last_gmo_time >= 1.0 / args.gmo_rate)
+        if update_gmo:
+            gmo_dt = now - last_gmo_time
+            last_gmo_time = now
+            pb.update_states(cur_l_q, cur_r_q)
+            M_l, Cq_l, G_l = pb.compute_dynamics("left", cur_l_q, cur_l_dq)
+            r_l = gmo_left.update(M_l, Cq_l, G_l, cur_l_tau, cur_l_dq, gmo_dt)
+            J_l = pb.compute_jacobian("left", cur_l_q, cur_l_dq)
+            cached_F_l = np.linalg.pinv(J_l.T) @ r_l
+            M_r, Cq_r, G_r = pb.compute_dynamics("right", cur_r_q, cur_r_dq)
+            r_r = gmo_right.update(M_r, Cq_r, G_r, cur_r_tau, cur_r_dq, gmo_dt)
+            J_r = pb.compute_jacobian("right", cur_r_q, cur_r_dq)
+            cached_F_r = np.linalg.pinv(J_r.T) @ r_r
+        F_l = cached_F_l.copy()
+        F_r = cached_F_r.copy()
 
         # GMO稳态偏置处理
         if phase == 1 and exp_time >= bias_collect_start:
@@ -759,12 +819,13 @@ def main():
             (requested_target_r - cur_r_q)**2)))
         left_tracking_rmse = float(np.sqrt(np.mean((target_l - cur_l_q)**2)))
         right_tracking_rmse = float(np.sqrt(np.mean((target_r - cur_r_q)**2)))
-        if ik_actuator is not None and sent_closure_origin is not None:
-            sent_target_closure = (
+        if (ik_actuator is not None and sent_closure_origin is not None and
+                update_kinematics):
+            cached_sent_target_closure = (
                 ik_actuator.measure_total_closure(target_l, target_r) -
                 sent_closure_origin)
-        else:
-            sent_target_closure = np.nan
+        sent_target_closure = (cached_sent_target_closure
+                               if ik_actuator is not None else np.nan)
 
         # 发送控制指令
         server.manager.set_arm_poses(target_l.tolist(), target_r.tolist(),
@@ -789,7 +850,8 @@ def main():
         record_count += 1
 
         # 打印
-        if exp_time - last_print >= 0.1:
+        if (args.print_rate > 0.0 and
+                exp_time - last_print >= 1.0 / args.print_rate):
             phase_str = ["MOVE", "GRASP", "TEST"][phase]
             fc_str = f"fc={fc:.2f}" + ("!" if fc > 1.0 else "")
             action_text = (f"MOVE loop={1.0/max(dt, 1e-6):.1f}Hz "
@@ -830,6 +892,7 @@ def main():
         # 阶段1: MOVE
         print(f"\n[阶段1] 运动到预备姿态 ({args.move_time}s)...")
         move_start = time.time()
+        scheduler.reset()
         while True:
             elapsed = time.time() - move_start
             if elapsed >= args.move_time:
@@ -839,7 +902,7 @@ def main():
             target_r = quintic_interpolate(
                 start_r, goal_r, elapsed, args.move_time)
             run_one_step(elapsed, target_l.copy(), target_r.copy())
-            time.sleep(t_step)
+            scheduler.wait()
 
         # 仍使用与GRASP/TEST相同的run_one_step下发链路。先在最终目标
         # 上保持move_settle_time，再进入额外的到位超时判断；旧时序把
@@ -848,12 +911,14 @@ def main():
         if args.move_settle_time > 0.0:
             print(f"\n[阶段1] 保持最终目标稳定 {args.move_settle_time:.2f}s...")
             settle_start = time.time()
+            scheduler.reset()
             while time.time() - settle_start < args.move_settle_time:
                 run_one_step(move_phase_time, goal_l.copy(), goal_r.copy(),
                              move_integral_enabled=True)
-                time.sleep(t_step)
+                scheduler.wait()
 
         convergence_start = time.time()
+        scheduler.reset()
         while True:
             run_one_step(move_phase_time, goal_l.copy(), goal_r.copy(),
                          move_integral_enabled=True)
@@ -870,7 +935,7 @@ def main():
                     f"R {move_joint_r}={move_signed_r:+.4f}rad；"
                     f"最大I-bias={max(np.max(np.abs(move_position_bias_l)), np.max(np.abs(move_position_bias_r))):.4f}rad；"
                     "request_gap为0时表示含补偿的位置命令已完整发送")
-            time.sleep(t_step)
+            scheduler.wait()
 
         # 补偿额外到位等待，使GRASP的实验时间仍从move_time开始。
         exp_start = time.time() - args.move_time
@@ -919,30 +984,34 @@ def main():
               "cmd/sent/actual从同一零点开始")
         # IK求解属于阶段切换准备，不计入GRASP时长，也不能形成一个大dt。
         exp_start += time.time() - rebase_start
-        last_time = time.time()
+        last_time = time.perf_counter()
+        last_gmo_time = last_time
+        last_kinematics_time = -np.inf
 
         # 阶段2: GRASP
         print(f"\n[阶段2] 保持姿态，GMO去偏采集 ({args.grasp_time}s)...")
         grasp_start = time.time()
+        scheduler.reset()
         while True:
             elapsed = time.time() - grasp_start
             exp_time = time.time() - exp_start
             if elapsed >= args.grasp_time:
                 break
             run_one_step(exp_time, hold_l.copy(), hold_r.copy())
-            time.sleep(t_step)
+            scheduler.wait()
         print(f"\n[阶段2] 完成")
 
         # 阶段3: TEST
         print(f"\n[阶段3] 碰撞测试 ({args.test_time}s) — 可施加外部冲击，期望内力保持固定")
         test_start = time.time()
+        scheduler.reset()
         while True:
             elapsed = time.time() - test_start
             exp_time = time.time() - exp_start
             if elapsed >= args.test_time:
                 break
             run_one_step(exp_time, hold_l.copy(), hold_r.copy())
-            time.sleep(t_step)
+            scheduler.wait()
         print(f"\n[阶段3] 测试完成")
         smooth_peak = (float(np.max(np.convolve(
             np.asarray(test_external_abs_history), np.ones(5)/5.0, mode='valid')))
@@ -950,6 +1019,12 @@ def main():
         print(f"[碰撞统计] TEST峰值外力={test_external_peak_abs:.3f}N "
               f"(signed={test_external_peak_signed:+.3f}N), "
               f"50ms平滑峰值={smooth_peak:.3f}N")
+        if loop_dt_history:
+            loop_hz = 1.0 / np.asarray(loop_dt_history)
+            print(f"[频率统计] median={np.median(loop_hz):.1f}Hz, "
+                  f"P05={np.percentile(loop_hz, 5):.1f}Hz, "
+                  f"overruns={scheduler.overruns}, "
+                  f"max_lateness={1000*scheduler.max_lateness:.2f}ms")
 
     except KeyboardInterrupt:
         print("\n\n[中断] 用户中断")
@@ -962,6 +1037,13 @@ def main():
         print("  实验结束，清理中...")
         print("=" * 80)
 
+        if loop_dt_history:
+            loop_hz = 1.0 / np.asarray(loop_dt_history)
+            data_file.write(
+                f"# frequency: median={np.median(loop_hz):.3f}Hz, "
+                f"p05={np.percentile(loop_hz, 5):.3f}Hz, "
+                f"overruns={scheduler.overruns}, "
+                f"max_lateness_ms={1000*scheduler.max_lateness:.3f}\n")
         data_file.write(f"# 记录总帧数: {record_count}\n")
         data_file.close()
         print(f"[数据] 已保存 {record_count} 帧到: {output_path}")

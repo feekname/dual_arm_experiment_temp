@@ -190,6 +190,10 @@ class G1Server:
 
     def _status_publisher_loop(self):
         while not self._stop_event.is_set():
+            if not self._subscribers:
+                # 实验脚本直接读取manager状态；没有订阅者时无需200Hz空轮询。
+                time.sleep(0.02)
+                continue
             state = self.manager.get_current_arm_states()
             # state["force_sensor"] = self.sensor.read_force()
             for sub in self._subscribers:

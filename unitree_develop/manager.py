@@ -1,5 +1,6 @@
 # manager.py
 import time
+import threading
 import numpy as np
 from typing import List, Optional
 from unitree_sdk2py.utils.thread import RecurrentThread
@@ -22,6 +23,7 @@ class G1DualArmManager:
         self.target_kp = np.zeros(30)
         self.target_kd = np.zeros(30)
         self.target_tau_ff = np.zeros(30) # 前馈力矩，用于抵消重力或搬运补偿
+        self._target_lock = threading.Lock()
         
         # 外部力矩/触觉数据接口（预留给你的传感器）
         self.external_force_data = {"left": None, "right": None}
@@ -62,21 +64,26 @@ class G1DualArmManager:
         # 1. 开启 arm_sdk 控制权 (权重位设为1)
         self.driver.low_cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = 1.0
 
-        # 2. 遍历所有受控关节（左右臂 + 腰部）
+        # 2. 原子读取同一帧双臂目标，避免上层100Hz更新时读到半帧数据。
+        with self._target_lock:
+            target_q = self.target_q.copy()
+            target_dq = self.target_dq.copy()
+
+        # 3. 遍历所有受控关节（左右臂 + 腰部）
         controlled_joints = self.config.left_arm_idx + self.config.right_arm_idx + self.config.waist_idx
 
         for idx in controlled_joints:
             # 填入指令数据
             self.driver.low_cmd.motor_cmd[idx].mode = 1
-            self.driver.low_cmd.motor_cmd[idx].q = self.target_q[idx]
-            self.driver.low_cmd.motor_cmd[idx].dq = self.target_dq[idx] # 搬运任务通常设为0，由内环控制速度
+            self.driver.low_cmd.motor_cmd[idx].q = target_q[idx]
+            self.driver.low_cmd.motor_cmd[idx].dq = target_dq[idx] # 搬运任务通常设为0，由内环控制速度
             self.driver.low_cmd.motor_cmd[idx].kp = self.config.kp
             self.driver.low_cmd.motor_cmd[idx].kd = self.config.kd
             # 本项目当前使用纯位置控制：显式清零，避免命令缓冲区残留
             # 任何历史前馈力矩。静差由上层位置命令偏置消除。
             self.driver.low_cmd.motor_cmd[idx].tau = 0.0
 
-        # 3. 发布指令
+        # 4. 发布指令
         self.driver.publish_cmd()
 
     # --- 高层 API 接口 ---
@@ -89,13 +96,14 @@ class G1DualArmManager:
             print("[Error] 角度数组长度不匹配")
             return
 
-        # 更新目标寄存器
-        for i, idx in enumerate(self.config.left_arm_idx):
-            self.target_q[idx] = left_q[i]
-            self.target_dq[idx] = left_dq[i]
-        for i, idx in enumerate(self.config.right_arm_idx):
-            self.target_q[idx] = right_q[i]
-            self.target_dq[idx] = right_dq[i]
+        # 左右臂必须作为同一控制帧原子更新。
+        with self._target_lock:
+            for i, idx in enumerate(self.config.left_arm_idx):
+                self.target_q[idx] = left_q[i]
+                self.target_dq[idx] = left_dq[i]
+            for i, idx in enumerate(self.config.right_arm_idx):
+                self.target_q[idx] = right_q[i]
+                self.target_dq[idx] = right_dq[i]
         
         # print('***************************')
         # print(f'发布指令： 左手： {left_q}')
