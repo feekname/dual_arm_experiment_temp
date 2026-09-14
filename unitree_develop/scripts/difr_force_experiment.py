@@ -150,12 +150,15 @@ class DIFRController:
     '''
     def __init__(self, F_0=5.6, F_min=5.5, F_max=12.0,
                  mu=0.4, m_object=0.45, alpha0=1.0, alpha1=5e5,
-                 delta_min=0.0, delta_max=0.03,
+                 delta_min=0.0, delta_max=0.015,
                  collision_threshold=8.0, fc_threshold=0.7, K_f=0.002, K_p=0.0,
                  roll_offset_max=0.10, force_deadband=0.2,
                  roll_offset_min=None, external_force_threshold=0.8,
                  activation_hold_time=1.0, delta_dot_max=0.02,
-                 force_rate_max=3.0, slip_force_deadband=0.1):
+                 force_rate_max=8.0, force_release_rate=2.0,
+                 slip_force_deadband=0.1, slip_release_force=0.3,
+                 slip_recovery_tau=0.8, force_drop_gain=0.0,
+                 force_drop_boost_max=0.0, force_rate_filter_tau=0.05):
         self.F_0 = F_0
         self.F_min = F_min
         self.F_max = F_max
@@ -177,24 +180,38 @@ class DIFRController:
         self.force_deadband = force_deadband
         self.delta_dot_max = delta_dot_max
         self.force_rate_max = force_rate_max
+        self.force_release_rate = force_release_rate
         self.slip_force_deadband = slip_force_deadband
+        self.slip_release_force = slip_release_force
+        self.slip_recovery_tau = slip_recovery_tau
+        self.force_drop_gain = force_drop_gain
+        self.force_drop_boost_max = force_drop_boost_max
+        self.force_rate_filter_tau = force_rate_filter_tau
 
         self.delta = 0.0
         self.delta_dot = 0.0
+        self.slip_risk = 0.0
         self.F_I_des = F_0
         self.F_I_qp_raw = F_0
         self.active = False
         self.activation_hold_remaining = 0.0
         self.roll_offset = 0.0
+        self.previous_force = None
+        self.force_rate_est = 0.0
+        self.force_drop_boost = 0.0
 
     def reset(self):
         self.delta = 0.0
         self.delta_dot = 0.0
+        self.slip_risk = 0.0
         self.F_I_des = self.F_0
         self.F_I_qp_raw = self.F_0
         self.active = False
         self.activation_hold_remaining = 0.0
         self.roll_offset = 0.0
+        self.previous_force = None
+        self.force_rate_est = 0.0
+        self.force_drop_boost = 0.0
 
     def update(self, F_E, F_I_est, gmo_force_norm, dt, dynamic_enabled=True):
         '''
@@ -208,7 +225,7 @@ class DIFRController:
 
         collision = gmo_force_norm > self.collision_threshold
         sensor_collision = force_demand > self.external_force_threshold
-        slip = abs(self.delta) > 0.005 or abs(self.delta_dot) > 0.02
+        slip = abs(self.slip_risk) > 0.005 or abs(self.delta_dot) > 0.01
         friction_margin_low = fc > self.fc_threshold
         # 直接传感器触发适配轻量物体；保持计时避免阈值附近逐帧开关。
         raw_trigger = collision or sensor_collision or slip or friction_margin_low
@@ -224,59 +241,70 @@ class DIFRController:
             self.activation_hold_remaining = 0.0
 
         if self.active:
-            # 标量化公式(41)：先求无约束最优解，再投影到全部可行区间。
-            k = self.mu * dt**2 / self.m_object
-            C = self.delta + self.delta_dot * dt + force_demand / self.m_object * dt**2
-            denom = self.alpha0 + self.alpha1 * k**2
-            F_I_star = (self.alpha0 * self.F_0 + self.alpha1 * k * C) / denom
-
-            # Eq. (41): δ边界、静态重力平衡、摩擦利用率和内力上下界。
-            slip_lower = (C - self.delta_max) / k
-            gravity_lower = self.m_object * 9.81 / max(2.0*self.mu, 1e-6)
-            friction_lower = force_demand / max(
-                self.mu * self.fc_threshold, 1e-6)
-            # F0在论文中定义为维持物体的最小标称内力；DIFR只能在其上
-            # 动态增力，不能因为瞬态QP解而把夹持力降到F0以下。
-            feasible_lower = max(
-                self.F_min, self.F_0, slip_lower,
-                gravity_lower, friction_lower)
-            feasible_upper = self.F_max
-            if feasible_lower <= feasible_upper:
-                F_I_qp_raw = float(np.clip(
-                    F_I_star, feasible_lower, feasible_upper))
+            # delta记录本次事件的累计估计滑移，不能在外力撤除后伪造
+            # “自动滑回”。slip_risk是供QP使用的可释放控制记忆。
+            releasing_slip = force_demand <= self.slip_release_force
+            if releasing_slip:
+                decay = np.exp(-dt / self.slip_recovery_tau)
+                self.slip_risk *= decay
+                self.delta_dot = 0.0
+                # 无外力时不再让历史累计滑移维持高期望内力。
+                F_I_qp_raw = self.F_0
             else:
-                # 冲击过大、F_max不足时优先执行安全上限，并由日志中的fc>1暴露不可行。
-                F_I_qp_raw = self.F_max
+                # 标量化公式(41)：先求无约束最优解，再投影到可行区间。
+                k = self.mu * dt**2 / self.m_object
+                C = (self.slip_risk + self.delta_dot * dt +
+                     force_demand / self.m_object * dt**2)
+                denom = self.alpha0 + self.alpha1 * k**2
+                F_I_star = (self.alpha0 * self.F_0 +
+                            self.alpha1 * k * C) / denom
+                slip_lower = (C - self.delta_max) / k
+                gravity_lower = self.m_object * 9.81 / max(2.0*self.mu, 1e-6)
+                friction_lower = force_demand / max(
+                    self.mu * self.fc_threshold, 1e-6)
+                feasible_lower = max(
+                    self.F_min, self.F_0, slip_lower,
+                    gravity_lower, friction_lower)
+                if feasible_lower <= self.F_max:
+                    F_I_qp_raw = float(np.clip(
+                        F_I_star, feasible_lower, self.F_max))
+                else:
+                    F_I_qp_raw = self.F_max
 
-            # 更新滑动状态
-            # QP预测使用候选F_I_des；状态传播使用传感器实际实现的内力。
-            # 这可避免把尚未建立的命令内力误当成可用摩擦力。
-            available_friction = self.mu * max(float(F_I_est), 0.0)
-            net_force = force_demand - available_friction
-            if abs(net_force) <= self.slip_force_deadband:
-                net_force = 0.0
-            if self.delta_dot <= 0.0 and net_force <= 0.0:
-                self.delta_dot = 0.0  # 静摩擦区
-            else:
-                self.delta_dot = np.clip(
-                    self.delta_dot + net_force / self.m_object * dt,
-                    0.0, self.delta_dot_max)
-            self.delta = float(np.clip(
-                self.delta + self.delta_dot * dt,
-                self.delta_min, self.delta_max))
+                # 状态传播使用传感器实际实现的内力，不能把尚未建立的
+                # 命令内力误当成已经可用的摩擦力。
+                available_friction = self.mu * max(float(F_I_est), 0.0)
+                net_force = force_demand - available_friction
+                if abs(net_force) <= self.slip_force_deadband:
+                    net_force = 0.0
+                if self.delta_dot <= 0.0 and net_force <= 0.0:
+                    self.delta_dot = 0.0  # 静摩擦区
+                else:
+                    self.delta_dot = np.clip(
+                        self.delta_dot + net_force / self.m_object * dt,
+                        0.0, self.delta_dot_max)
+                self.delta = float(np.clip(
+                    self.delta + self.delta_dot * dt,
+                    self.delta_min, self.delta_max))
+                self.slip_risk = float(np.clip(
+                    self.slip_risk + self.delta_dot * dt,
+                    self.delta_min, self.delta_max))
         else:
             F_I_qp_raw = self.F_0
-            self.delta *= 0.95
-            self.delta_dot *= 0.95
+            decay = np.exp(-dt / self.slip_recovery_tau)
+            self.slip_risk *= decay
+            if force_demand <= self.slip_release_force:
+                self.delta_dot = 0.0
 
         # 期望内力变化率限制：防止QP一帧跳到上限，同时保留Low/Medium/
         # High随扰动强度变化的可观测上升过程。
         self.F_I_qp_raw = F_I_qp_raw
-        force_step = self.force_rate_max * dt
+        rise_step = self.force_rate_max * dt
+        release_step = self.force_release_rate * dt
         F_I_des = float(np.clip(
             F_I_qp_raw,
-            self.F_I_des - force_step,
-            self.F_I_des + force_step))
+            self.F_I_des - release_step,
+            self.F_I_des + rise_step))
         self.F_I_des = F_I_des
         fc = force_demand / max(self.mu * F_I_des, 1e-6)
 
@@ -284,8 +312,26 @@ class DIFRController:
         force_error = F_I_des - F_I_est
         if abs(force_error) < self.force_deadband:
             force_error = 0.0
+
+        # 碰撞可能造成接触面瞬时张开，使实际内力先下降。使用经低通的
+        # 实际内力下降速度产生一个受限的临时闭合补偿；补偿不进入积分
+        # 状态，外力消失后会立即撤除，不会导致长期夹得过紧。
+        if self.previous_force is None:
+            raw_force_rate = 0.0
+        else:
+            raw_force_rate = (float(F_I_est) - self.previous_force) / dt
+        self.previous_force = float(F_I_est)
+        rate_alpha = dt / (self.force_rate_filter_tau + dt)
+        self.force_rate_est += rate_alpha * (raw_force_rate - self.force_rate_est)
+        if self.active and force_demand > self.slip_release_force:
+            self.force_drop_boost = float(np.clip(
+                self.force_drop_gain * max(-self.force_rate_est, 0.0),
+                0.0, self.force_drop_boost_max))
+        else:
+            self.force_drop_boost = 0.0
         integral_candidate = self.roll_offset + self.K_f * force_error * dt
-        command_unclipped = integral_candidate + self.K_p * force_error
+        command_unclipped = (integral_candidate + self.K_p * force_error +
+                             self.force_drop_boost)
         delta_roll = float(np.clip(
             command_unclipped, self.roll_offset_min, self.roll_offset_max))
         driving_further = ((command_unclipped > self.roll_offset_max and force_error > 0.0) or
@@ -533,10 +579,16 @@ def main():
                         help='左手去偏切向力直接触发阈值(N)，适用于轻量物体')
     parser.add_argument('--activation-hold-time', type=float, default=1.0,
                         help='触发消失后保持DIFR激活的时间(s)，避免阈值附近抖动')
-    parser.add_argument('--force-rate-max', type=float, default=3.0,
-                        help='期望内力最大变化速度(N/s)，避免瞬间跳到上限')
+    parser.add_argument('--force-rate-max', type=float, default=8.0,
+                        help='碰撞时期望内力最大上升速度(N/s)')
+    parser.add_argument('--force-release-rate', type=float, default=2.0,
+                        help='外力撤除后期望内力回落速度(N/s)')
     parser.add_argument('--slip-force-deadband', type=float, default=0.1,
                         help='滑移传播使用的摩擦缺口死区(N)，抑制噪声累积')
+    parser.add_argument('--slip-release-force', type=float, default=0.3,
+                        help='低于该外力时释放滑移风险状态(N)')
+    parser.add_argument('--slip-recovery-tau', type=float, default=0.8,
+                        help='无外力时滑移风险状态衰减时间常数(s)')
     parser.add_argument('--K-f', type=float, default=0.002,
                         help='roll模式的力误差积分增益，单位rad/(N*s)')
     parser.add_argument('--actuation-mode', choices=['roll', 'ik'], default='roll',
@@ -555,6 +607,12 @@ def main():
                         help='roll模式力误差比例增益，单位rad/N')
     parser.add_argument('--ik-force-kp', type=float, default=0.0004,
                         help='IK模式力误差比例增益，单位m/N；发送端仍有逐帧限幅')
+    parser.add_argument('--ik-force-drop-gain', type=float, default=0.00005,
+                        help='IK模式实际内力下降速度到临时闭合量的增益(m/(N/s))')
+    parser.add_argument('--ik-force-drop-max', type=float, default=0.0015,
+                        help='碰撞内力下降补偿的最大总闭合量(m)')
+    parser.add_argument('--force-rate-filter-tau', type=float, default=0.05,
+                        help='实际内力变化率低通时间常数(s)')
     parser.add_argument('--delta-dot-max', type=float, default=0.02,
                         help='滑移状态速度上限(m/s)，仅为估计器防发散')
     parser.add_argument('--ik-damping', type=float, default=0.04)
@@ -570,8 +628,8 @@ def main():
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
     if args.actuation_mode == 'ik':
-        if not (0.0 < args.ik_max_displacement <= 0.03):
-            parser.error('--ik-max-displacement必须在(0, 0.03] m内；更大位移需先重新仿真验证')
+        if not (0.0 < args.ik_max_displacement <= 0.015):
+            parser.error('--ik-max-displacement必须在(0, 0.015] m内；更大位移需先重新仿真验证')
         if args.ik_force_gain <= 0.0 or args.ik_force_kp < 0.0 or args.ik_joint_delta_max <= 0.0:
             parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
     gravity_lower = args.m_object * 9.81 / max(2.0 * args.mu, 1e-6)
@@ -585,9 +643,12 @@ def main():
             f'重力内力下界{gravity_lower:.3f}N超过F-max={args.F_max:.3f}N；'
             '请检查物体质量、摩擦系数或最大内力')
     if (args.delta_max <= args.delta_min or args.delta_dot_max <= 0.0 or
-            args.force_rate_max <= 0.0 or args.slip_force_deadband < 0.0 or
+            args.force_rate_max <= 0.0 or args.force_release_rate <= 0.0 or
+            args.slip_force_deadband < 0.0 or args.slip_release_force < 0.0 or
+            args.slip_recovery_tau <= 0.0 or args.ik_force_drop_gain < 0.0 or
+            args.ik_force_drop_max < 0.0 or args.force_rate_filter_tau <= 0.0 or
             not (0.0 < args.fc_threshold <= 1.0)):
-        parser.error('滑移范围/速度、内力变化率、死区或fc-threshold参数无效')
+        parser.error('滑移释放、内力变化率、下降补偿或fc-threshold参数无效')
     if (args.move_settle_time < 0.0 or args.move_joint_speed_max <= 0.0 or
             args.move_convergence_timeout <= 0.0 or
             args.move_goal_tolerance <= 0.0 or args.move_position_ki < 0.0 or
@@ -615,7 +676,7 @@ def main():
     print(f"  QP参数: F_0={args.F0}, F∈[{args.F_min},{args.F_max}], "
           f"μ={args.mu}, m_o={args.m_object}, α1={args.alpha1:.3g}")
     print(f"  重力下界: {gravity_lower:.3f}N | 期望内力限速: "
-          f"{args.force_rate_max:.2f}N/s")
+          f"上升{args.force_rate_max:.2f}/下降{args.force_release_rate:.2f}N/s")
     print("=" * 80)
 
     if args.output:
@@ -647,6 +708,10 @@ def main():
                   if args.actuation_mode == 'ik' else args.roll_offset_max)
     force_gain = args.ik_force_gain if args.actuation_mode == 'ik' else args.K_f
     force_kp = args.ik_force_kp if args.actuation_mode == 'ik' else args.force_kp
+    force_drop_gain = (args.ik_force_drop_gain
+                       if args.actuation_mode == 'ik' else 0.0)
+    force_drop_max = (args.ik_force_drop_max
+                      if args.actuation_mode == 'ik' else 0.0)
     difr = DIFRController(F_0=args.F0, F_min=args.F_min, F_max=args.F_max,
                            mu=args.mu, m_object=args.m_object,
                            alpha0=args.alpha0, alpha1=args.alpha1,
@@ -661,7 +726,13 @@ def main():
                            roll_offset_min=(0.0 if args.actuation_mode == 'ik' else None),
                            delta_dot_max=args.delta_dot_max,
                            force_rate_max=args.force_rate_max,
-                           slip_force_deadband=args.slip_force_deadband)
+                           force_release_rate=args.force_release_rate,
+                           slip_force_deadband=args.slip_force_deadband,
+                           slip_release_force=args.slip_release_force,
+                           slip_recovery_tau=args.slip_recovery_tau,
+                           force_drop_gain=force_drop_gain,
+                           force_drop_boost_max=force_drop_max,
+                           force_rate_filter_tau=args.force_rate_filter_tau)
 
     goal_l = np.array(args.left_q)
     goal_r = np.array(args.right_q)
@@ -706,7 +777,8 @@ def main():
         f"F_max={args.F_max}, mu={args.mu}, m_object={args.m_object}, "
         f"alpha0={args.alpha0}, alpha1={args.alpha1}, "
         f"fc_threshold={args.fc_threshold}, "
-        f"force_rate_max={args.force_rate_max}\n")
+        f"force_rise_rate={args.force_rate_max}, "
+        f"force_release_rate={args.force_release_rate}\n")
     data_file.write(f"# actuation_mode: {args.actuation_mode}\n")
     data_file.write(f"# timing: control_rate={args.control_rate}Hz, "
                     f"gmo_rate={args.gmo_rate}Hz, "
@@ -717,7 +789,12 @@ def main():
     data_file.write(f"# force_PI: Ki={force_gain}, Kp={force_kp}; "
                     f"delta_limits=[{args.delta_min},{args.delta_max}], "
                     f"delta_dot_max={args.delta_dot_max}, "
-                    f"slip_force_deadband={args.slip_force_deadband}\n")
+                    f"slip_force_deadband={args.slip_force_deadband}, "
+                    f"slip_release_force={args.slip_release_force}, "
+                    f"slip_recovery_tau={args.slip_recovery_tau}; "
+                    f"force_drop_gain={force_drop_gain}, "
+                    f"force_drop_max={force_drop_max}, "
+                    f"force_rate_filter_tau={args.force_rate_filter_tau}\n")
     data_file.write(
         f"# MOVE纯位置外环: Ki={args.move_position_ki}, "
         f"bias_max={args.move_position_bias_max}rad, "
@@ -733,7 +810,9 @@ def main():
                      "actual_total_closure(m) closure_limit(m) "
                      "left_joint_tracking_rmse(rad) right_joint_tracking_rmse(rad) "
                      "sent_target_total_closure(m) "
-                     "F_I_qp_raw(N) delta_dot(m/s)\n")
+                     "F_I_qp_raw(N) delta_dot(m/s) "
+                     "F_I_rate_filtered(N/s) force_drop_boost(m) "
+                     "slip_risk(m)\n")
     data_file.write("#" + "=" * 80 + "\n")
 
     print("\n" + "=" * 80)
@@ -894,6 +973,7 @@ def main():
             if not test_dynamic_state_reset:
                 difr.delta = 0.0
                 difr.delta_dot = 0.0
+                difr.slip_risk = 0.0
                 difr.active = False
                 test_dynamic_state_reset = True
             F_E = F_E_sensor - tangent_bias
@@ -993,7 +1073,8 @@ def main():
             [actual_closure,
              action_max if args.actuation_mode == 'ik' else np.nan,
              left_tracking_rmse, right_tracking_rmse, sent_target_closure,
-             difr.F_I_qp_raw, difr.delta_dot]
+             difr.F_I_qp_raw, difr.delta_dot,
+             difr.force_rate_est, difr.force_drop_boost, difr.slip_risk]
         ])
         data_file.write(" ".join([f"{v:.6f}" for v in row]) + "\n")
         record_count += 1
@@ -1033,7 +1114,10 @@ def main():
                   f"F_I_qp/des/est={difr.F_I_qp_raw:4.1f}/"
                   f"{F_I_des:4.1f}/{F_I_est:4.1f}N | "
                   f"δ={1000*delta:5.1f}mm "
+                  f"risk={1000*difr.slip_risk:5.1f}mm "
                   f"δdot={1000*difr.delta_dot:5.1f}mm/s {fc_str} | "
+                  f"Fdot={difr.force_rate_est:+5.1f}N/s "
+                  f"drop+={1000*difr.force_drop_boost:4.1f}mm | "
                   f"{action_text} | {impact_text} | "
                   f"左传感器 Fn={f_left_normal:5.1f} Ft={F_E_sensor:+5.1f}",
                   end="", flush=True)

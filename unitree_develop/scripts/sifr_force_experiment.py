@@ -120,8 +120,11 @@ class SIFRController:
     '''
     def __init__(self, F_fixed=5.6, mu=0.4, m_object=0.45, K_f=0.002,
                  K_p=0.0, roll_offset_max=0.10, force_deadband=0.2,
-                 roll_offset_min=None, delta_min=0.0, delta_max=0.03,
-                 delta_dot_max=0.02, slip_force_deadband=0.1):
+                 roll_offset_min=None, delta_min=0.0, delta_max=0.015,
+                 delta_dot_max=0.02, slip_force_deadband=0.1,
+                 slip_release_force=0.3, slip_recovery_tau=0.8,
+                 force_drop_gain=0.0, force_drop_boost_max=0.0,
+                 force_rate_filter_tau=0.05):
         self.F_fixed = F_fixed
         self.mu = mu
         self.m_object = m_object
@@ -135,14 +138,25 @@ class SIFRController:
         self.delta_max = delta_max
         self.delta_dot_max = delta_dot_max
         self.slip_force_deadband = slip_force_deadband
+        self.slip_release_force = slip_release_force
+        self.slip_recovery_tau = slip_recovery_tau
+        self.force_drop_gain = force_drop_gain
+        self.force_drop_boost_max = force_drop_boost_max
+        self.force_rate_filter_tau = force_rate_filter_tau
         self.delta = 0.0
         self.delta_dot = 0.0
         self.roll_offset = 0.0
+        self.previous_force = None
+        self.force_rate_est = 0.0
+        self.force_drop_boost = 0.0
 
     def reset(self):
         self.delta = 0.0
         self.delta_dot = 0.0
         self.roll_offset = 0.0
+        self.previous_force = None
+        self.force_rate_est = 0.0
+        self.force_drop_boost = 0.0
 
     def update(self, F_E, F_I_est, dt):
         '''
@@ -150,6 +164,7 @@ class SIFRController:
         Returns:
             F_I_des(=F_fixed), delta_roll, delta, fc, active(始终False)
         '''
+        dt = float(np.clip(dt, 1e-4, 0.05))
         # 期望内力固定
         F_I_des = self.F_fixed
 
@@ -157,18 +172,24 @@ class SIFRController:
         force_demand = abs(F_E)
         # 状态估计必须使用传感器实际实现的内力，而不是控制器期望值。
         # 否则在真机跟踪滞后时会错误假设摩擦力已经建立。
-        available_friction = self.mu * max(float(F_I_est), 0.0)
-        net_force = force_demand - available_friction
-        if abs(net_force) <= self.slip_force_deadband:
-            net_force = 0.0
-        if self.delta_dot <= 0.0 and net_force <= 0.0:
-            self.delta_dot = 0.0  # 静摩擦区：不允许“反向滑移”伪影
+        if force_demand <= self.slip_release_force:
+            # 累计估计滑移不能在无外力时自动回零；静摩擦重新建立后
+            # 只把速度置零，位移保持在事件结束值。
+            self.delta_dot = 0.0
         else:
-            self.delta_dot = np.clip(
-                self.delta_dot + net_force / self.m_object * dt,
-                0.0, self.delta_dot_max)
-        self.delta = np.clip(
-            self.delta + self.delta_dot * dt, self.delta_min, self.delta_max)
+            available_friction = self.mu * max(float(F_I_est), 0.0)
+            net_force = force_demand - available_friction
+            if abs(net_force) <= self.slip_force_deadband:
+                net_force = 0.0
+            if self.delta_dot <= 0.0 and net_force <= 0.0:
+                self.delta_dot = 0.0
+            else:
+                self.delta_dot = np.clip(
+                    self.delta_dot + net_force / self.m_object * dt,
+                    0.0, self.delta_dot_max)
+            self.delta = np.clip(
+                self.delta + self.delta_dot * dt,
+                self.delta_min, self.delta_max)
         # 摩擦锥裕度
         fc = force_demand / max(self.mu * F_I_des, 1e-6)
 
@@ -177,8 +198,22 @@ class SIFRController:
         force_error = F_I_des - F_I_est
         if abs(force_error) < self.force_deadband:
             force_error = 0.0
+        if self.previous_force is None:
+            raw_force_rate = 0.0
+        else:
+            raw_force_rate = (float(F_I_est) - self.previous_force) / dt
+        self.previous_force = float(F_I_est)
+        rate_alpha = dt / (self.force_rate_filter_tau + dt)
+        self.force_rate_est += rate_alpha * (raw_force_rate - self.force_rate_est)
+        if force_demand > self.slip_release_force:
+            self.force_drop_boost = float(np.clip(
+                self.force_drop_gain * max(-self.force_rate_est, 0.0),
+                0.0, self.force_drop_boost_max))
+        else:
+            self.force_drop_boost = 0.0
         integral_candidate = self.roll_offset + self.K_f * force_error * dt
-        command_unclipped = integral_candidate + self.K_p * force_error
+        command_unclipped = (integral_candidate + self.K_p * force_error +
+                             self.force_drop_boost)
         delta_roll = float(np.clip(
             command_unclipped, self.roll_offset_min, self.roll_offset_max))
         # 条件积分抗饱和：误差继续把指令推向饱和端时暂停积分。
@@ -431,6 +466,16 @@ def main():
                         help='滑移状态速度上限(m/s)，仅为估计器防发散')
     parser.add_argument('--slip-force-deadband', type=float, default=0.1,
                         help='滑移传播使用的摩擦缺口死区(N)，抑制噪声累积')
+    parser.add_argument('--slip-release-force', type=float, default=0.3,
+                        help='低于该外力时释放滑移风险状态(N)')
+    parser.add_argument('--slip-recovery-tau', type=float, default=0.8,
+                        help='无外力时滑移风险状态衰减时间常数(s)')
+    parser.add_argument('--ik-force-drop-gain', type=float, default=0.00005,
+                        help='IK模式实际内力下降速度到临时闭合量的增益(m/(N/s))')
+    parser.add_argument('--ik-force-drop-max', type=float, default=0.0015,
+                        help='碰撞内力下降补偿的最大总闭合量(m)')
+    parser.add_argument('--force-rate-filter-tau', type=float, default=0.05,
+                        help='实际内力变化率低通时间常数(s)')
     parser.add_argument('--ik-damping', type=float, default=0.04)
     parser.add_argument('--ik-iterations', type=int, default=160)
     parser.add_argument('--ik-max-step', type=float, default=0.005,
@@ -443,12 +488,14 @@ def main():
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
     if args.actuation_mode == 'ik':
-        if not (0.0 < args.ik_max_displacement <= 0.03):
-            parser.error('--ik-max-displacement必须在(0, 0.03] m内；更大位移需先重新仿真验证')
+        if not (0.0 < args.ik_max_displacement <= 0.015):
+            parser.error('--ik-max-displacement必须在(0, 0.015] m内；更大位移需先重新仿真验证')
         if args.ik_force_gain <= 0.0 or args.ik_force_kp < 0.0 or args.ik_joint_delta_max <= 0.0:
             parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
     if (args.delta_max <= args.delta_min or args.delta_dot_max <= 0.0 or
-            args.slip_force_deadband < 0.0):
+            args.slip_force_deadband < 0.0 or args.slip_release_force < 0.0 or
+            args.slip_recovery_tau <= 0.0 or args.ik_force_drop_gain < 0.0 or
+            args.ik_force_drop_max < 0.0 or args.force_rate_filter_tau <= 0.0):
         parser.error('--delta-max必须大于--delta-min，且--delta-dot-max必须为正数')
     if args.F_fixed <= 0.0 or args.mu <= 0.0 or args.m_object <= 0.0:
         parser.error('--F-fixed、--mu和--m-object必须为正数')
@@ -511,6 +558,10 @@ def main():
                   if args.actuation_mode == 'ik' else args.roll_offset_max)
     force_gain = args.ik_force_gain if args.actuation_mode == 'ik' else args.K_f
     force_kp = args.ik_force_kp if args.actuation_mode == 'ik' else args.force_kp
+    force_drop_gain = (args.ik_force_drop_gain
+                       if args.actuation_mode == 'ik' else 0.0)
+    force_drop_max = (args.ik_force_drop_max
+                      if args.actuation_mode == 'ik' else 0.0)
     sifr = SIFRController(F_fixed=args.F_fixed, mu=args.mu,
                            m_object=args.m_object, K_f=force_gain, K_p=force_kp,
                            roll_offset_max=action_max,
@@ -518,7 +569,12 @@ def main():
                            roll_offset_min=(0.0 if args.actuation_mode == 'ik' else None),
                            delta_min=args.delta_min, delta_max=args.delta_max,
                            delta_dot_max=args.delta_dot_max,
-                           slip_force_deadband=args.slip_force_deadband)
+                           slip_force_deadband=args.slip_force_deadband,
+                           slip_release_force=args.slip_release_force,
+                           slip_recovery_tau=args.slip_recovery_tau,
+                           force_drop_gain=force_drop_gain,
+                           force_drop_boost_max=force_drop_max,
+                           force_rate_filter_tau=args.force_rate_filter_tau)
 
     goal_l = np.array(args.left_q)
     goal_r = np.array(args.right_q)
@@ -570,7 +626,12 @@ def main():
     data_file.write(f"# force_PI: Ki={force_gain}, Kp={force_kp}; "
                     f"delta_limits=[{args.delta_min},{args.delta_max}], "
                     f"delta_dot_max={args.delta_dot_max}, "
-                    f"slip_force_deadband={args.slip_force_deadband}\n")
+                    f"slip_force_deadband={args.slip_force_deadband}, "
+                    f"slip_release_force={args.slip_release_force}, "
+                    f"slip_recovery_tau={args.slip_recovery_tau}; "
+                    f"force_drop_gain={force_drop_gain}, "
+                    f"force_drop_max={force_drop_max}, "
+                    f"force_rate_filter_tau={args.force_rate_filter_tau}\n")
     data_file.write(
         f"# MOVE纯位置外环: Ki={args.move_position_ki}, "
         f"bias_max={args.move_position_bias_max}rad, "
@@ -585,7 +646,8 @@ def main():
                      "force_left_6dof(6) "
                      "actual_total_closure(m) closure_limit(m) "
                      "left_joint_tracking_rmse(rad) right_joint_tracking_rmse(rad) "
-                     "sent_target_total_closure(m) delta_dot(m/s)\n")
+                     "sent_target_total_closure(m) delta_dot(m/s) "
+                     "F_I_rate_filtered(N/s) force_drop_boost(m)\n")
     data_file.write("#" + "=" * 80 + "\n")
 
     print("\n" + "=" * 80)
@@ -844,7 +906,7 @@ def main():
             [actual_closure,
              action_max if args.actuation_mode == 'ik' else np.nan,
              left_tracking_rmse, right_tracking_rmse, sent_target_closure,
-             sifr.delta_dot]
+             sifr.delta_dot, sifr.force_rate_est, sifr.force_drop_boost]
         ])
         data_file.write(" ".join([f"{v:.6f}" for v in row]) + "\n")
         record_count += 1
@@ -883,6 +945,8 @@ def main():
                   f"F_I={F_I_des:5.1f}(fixed) est={F_I_est:5.1f} | "
                   f"δ={1000*delta:5.1f}mm "
                   f"δdot={1000*sifr.delta_dot:5.1f}mm/s {fc_str} | "
+                  f"Fdot={sifr.force_rate_est:+5.1f}N/s "
+                  f"drop+={1000*sifr.force_drop_boost:4.1f}mm | "
                   f"{action_text} | {impact_text} | "
                   f"左传感器 Fn={f_left_normal:5.1f} Ft={F_E_sensor:+5.1f}",
                   end="", flush=True)
