@@ -22,7 +22,7 @@ Description: 双臂协作搬运实验 — SIFR (力传感器版本, 对比实验
       --left_q  -0.8 0.7 -0.7 0.4 0.0 -0.6 0.0 \
       --right_q  0.8 0.7  0.7 0.4 0.0  0.6 0.0 \
       --shm-name 6_axis_force_shm \
-      --F-fixed 16.35 --mu 0.3 --m-object 1.0
+      --F-fixed 5.6 --mu 0.4 --m-object 0.45 --actuation-mode ik
 '''
 import os
 import sys
@@ -118,10 +118,10 @@ class SIFRController:
     Static Internal Force Regulation: 期望内力固定为F_fixed
     仍然估计滑动位移δ（用于记录对比），但不用于调节内力
     '''
-    def __init__(self, F_fixed=16.35, mu=0.3, m_object=1.0, K_f=0.002,
+    def __init__(self, F_fixed=5.6, mu=0.4, m_object=0.45, K_f=0.002,
                  K_p=0.0, roll_offset_max=0.10, force_deadband=0.2,
-                 roll_offset_min=None, delta_min=0.0, delta_max=0.05,
-                 delta_dot_max=0.5):
+                 roll_offset_min=None, delta_min=0.0, delta_max=0.015,
+                 delta_dot_max=0.02, slip_force_deadband=0.1):
         self.F_fixed = F_fixed
         self.mu = mu
         self.m_object = m_object
@@ -134,6 +134,7 @@ class SIFRController:
         self.delta_min = delta_min
         self.delta_max = delta_max
         self.delta_dot_max = delta_dot_max
+        self.slip_force_deadband = slip_force_deadband
         self.delta = 0.0
         self.delta_dot = 0.0
         self.roll_offset = 0.0
@@ -158,6 +159,8 @@ class SIFRController:
         # 否则在真机跟踪滞后时会错误假设摩擦力已经建立。
         available_friction = self.mu * max(float(F_I_est), 0.0)
         net_force = force_demand - available_friction
+        if abs(net_force) <= self.slip_force_deadband:
+            net_force = 0.0
         if self.delta_dot <= 0.0 and net_force <= 0.0:
             self.delta_dot = 0.0  # 静摩擦区：不允许“反向滑移”伪影
         else:
@@ -370,10 +373,10 @@ def main():
     parser.add_argument('--normal-sign', type=float, choices=[-1.0, 1.0], default=-1.0)
     parser.add_argument('--tangent-sign', type=float, choices=[-1.0, 1.0], default=-1.0)
     # SIFR参数
-    parser.add_argument('--F-fixed', type=float, default=16.35,
-                        help='固定期望内力 (N), 默认16.35=1kg*9.81/(2*0.3)')
-    parser.add_argument('--mu', type=float, default=0.3)
-    parser.add_argument('--m-object', type=float, default=1.0)
+    parser.add_argument('--F-fixed', type=float, default=5.6,
+                        help='固定期望内力(N)，0.45kg/μ=0.4时重力下界约5.52N')
+    parser.add_argument('--mu', type=float, default=0.4)
+    parser.add_argument('--m-object', type=float, default=0.45)
     parser.add_argument('--K-f', type=float, default=0.002,
                         help='roll模式的力误差积分增益，单位rad/(N*s)')
     parser.add_argument('--actuation-mode', choices=['roll', 'ik'], default='roll',
@@ -386,34 +389,39 @@ def main():
                         help='若增大指令反而减小夹持力，设为-1')
     parser.add_argument('--ik-max-displacement', type=float, default=0.015,
                         help='IK模式每只手最大法向位移(m)，两手总闭合量为其2倍')
-    parser.add_argument('--ik-force-gain', type=float, default=0.0002,
+    parser.add_argument('--ik-force-gain', type=float, default=0.0008,
                         help='IK模式力误差积分增益，单位m/(N*s)')
     parser.add_argument('--force-kp', type=float, default=0.0,
                         help='roll模式力误差比例增益，单位rad/N')
-    parser.add_argument('--ik-force-kp', type=float, default=0.0001,
+    parser.add_argument('--ik-force-kp', type=float, default=0.0004,
                         help='IK模式力误差比例增益，单位m/N；发送端仍有逐帧限幅')
     parser.add_argument('--delta-min', type=float, default=0.0)
-    parser.add_argument('--delta-max', type=float, default=0.05)
-    parser.add_argument('--delta-dot-max', type=float, default=0.5,
+    parser.add_argument('--delta-max', type=float, default=0.015)
+    parser.add_argument('--delta-dot-max', type=float, default=0.02,
                         help='滑移状态速度上限(m/s)，仅为估计器防发散')
+    parser.add_argument('--slip-force-deadband', type=float, default=0.1,
+                        help='滑移传播使用的摩擦缺口死区(N)，抑制噪声累积')
     parser.add_argument('--ik-damping', type=float, default=0.04)
     parser.add_argument('--ik-iterations', type=int, default=160)
     parser.add_argument('--ik-max-step', type=float, default=0.005,
                         help='启动时IK每次迭代的单关节最大步长(rad)')
     # 关节角增量限幅
     parser.add_argument('--joint-delta-max', type=float, default=0.008)
-    parser.add_argument('--ik-joint-delta-max', type=float, default=0.001,
+    parser.add_argument('--ik-joint-delta-max', type=float, default=0.002,
                         help='IK模式每帧单关节最大变化量(rad)，并与joint-delta-max取较小值')
     parser.add_argument('--output', type=str, default='sifr_force.txt')
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
     if args.actuation_mode == 'ik':
-        if not (0.0 < args.ik_max_displacement <= 0.03):
-            parser.error('--ik-max-displacement必须在(0, 0.03] m内；更大位移需先重新仿真验证')
+        if not (0.0 < args.ik_max_displacement <= 0.015):
+            parser.error('--ik-max-displacement必须在(0, 0.015] m内；更大位移需先重新仿真验证')
         if args.ik_force_gain <= 0.0 or args.ik_force_kp < 0.0 or args.ik_joint_delta_max <= 0.0:
             parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
-    if args.delta_max <= args.delta_min or args.delta_dot_max <= 0.0:
+    if (args.delta_max <= args.delta_min or args.delta_dot_max <= 0.0 or
+            args.slip_force_deadband < 0.0):
         parser.error('--delta-max必须大于--delta-min，且--delta-dot-max必须为正数')
+    if args.F_fixed <= 0.0 or args.mu <= 0.0 or args.m_object <= 0.0:
+        parser.error('--F-fixed、--mu和--m-object必须为正数')
     if (args.move_settle_time < 0.0 or args.move_joint_speed_max <= 0.0 or
             args.move_convergence_timeout <= 0.0 or
             args.move_goal_tolerance <= 0.0 or args.move_position_ki < 0.0 or
@@ -428,6 +436,10 @@ def main():
     print(f"  阶段1 MOVE:  {args.move_time}s")
     print(f"  阶段2 GRASP: {args.grasp_time}s (GMO去偏采集)")
     print(f"  阶段3 TEST:  {args.test_time}s (期望内力固定={args.F_fixed}N)")
+    gravity_lower = args.m_object * 9.81 / (2.0 * args.mu)
+    print(f"  重力静态内力下界: {gravity_lower:.3f}N/手")
+    if args.F_fixed < gravity_lower:
+        print(f"  [警告] F_fixed低于重力静态下界，物体可能持续滑移")
     print(f"  力传感器共享内存: {args.shm_name}")
     print(f"  执行方式: {args.actuation_mode.upper()}")
     print("=" * 80)
@@ -467,7 +479,8 @@ def main():
                            force_deadband=args.force_deadband,
                            roll_offset_min=(0.0 if args.actuation_mode == 'ik' else None),
                            delta_min=args.delta_min, delta_max=args.delta_max,
-                           delta_dot_max=args.delta_dot_max)
+                           delta_dot_max=args.delta_dot_max,
+                           slip_force_deadband=args.slip_force_deadband)
 
     goal_l = np.array(args.left_q)
     goal_r = np.array(args.right_q)
@@ -514,7 +527,8 @@ def main():
     data_file.write(f"# ik_max_displacement_per_hand_m: {args.ik_max_displacement}\n")
     data_file.write(f"# force_PI: Ki={force_gain}, Kp={force_kp}; "
                     f"delta_limits=[{args.delta_min},{args.delta_max}], "
-                    f"delta_dot_max={args.delta_dot_max}\n")
+                    f"delta_dot_max={args.delta_dot_max}, "
+                    f"slip_force_deadband={args.slip_force_deadband}\n")
     data_file.write(
         f"# MOVE纯位置外环: Ki={args.move_position_ki}, "
         f"bias_max={args.move_position_bias_max}rad, "
@@ -529,7 +543,7 @@ def main():
                      "force_left_6dof(6) "
                      "actual_total_closure(m) closure_limit(m) "
                      "left_joint_tracking_rmse(rad) right_joint_tracking_rmse(rad) "
-                     "sent_target_total_closure(m)\n")
+                     "sent_target_total_closure(m) delta_dot(m/s)\n")
     data_file.write("#" + "=" * 80 + "\n")
 
     print("\n" + "=" * 80)
@@ -768,7 +782,8 @@ def main():
             f_left_6d,
             [actual_closure,
              action_max if args.actuation_mode == 'ik' else np.nan,
-             left_tracking_rmse, right_tracking_rmse, sent_target_closure]
+             left_tracking_rmse, right_tracking_rmse, sent_target_closure,
+             sifr.delta_dot]
         ])
         data_file.write(" ".join([f"{v:.6f}" for v in row]) + "\n")
         record_count += 1
@@ -804,7 +819,8 @@ def main():
             print(f"\r  t={exp_time:5.2f}s [{phase_str}] [SIFR-fixed] | "
                   f"GMO={gmo_force:5.1f}N F_E={F_E:5.1f}N | "
                   f"F_I={F_I_des:5.1f}(fixed) est={F_I_est:5.1f} | "
-                  f"δ={delta:+.4f} {fc_str} | "
+                  f"δ={1000*delta:5.1f}mm "
+                  f"δdot={1000*sifr.delta_dot:5.1f}mm/s {fc_str} | "
                   f"{action_text} | {impact_text} | "
                   f"左传感器 Fn={f_left_normal:5.1f} Ft={F_E_sensor:+5.1f}",
                   end="", flush=True)
