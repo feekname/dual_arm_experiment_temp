@@ -150,7 +150,7 @@ class DIFRController:
     '''
     def __init__(self, F_0=5.6, F_min=5.5, F_max=12.0,
                  mu=0.4, m_object=0.45, alpha0=1.0, alpha1=5e5,
-                 delta_min=0.0, delta_max=0.015,
+                 delta_min=0.0, delta_max=0.03,
                  collision_threshold=8.0, fc_threshold=0.7, K_f=0.002, K_p=0.0,
                  roll_offset_max=0.10, force_deadband=0.2,
                  roll_offset_min=None, external_force_threshold=0.8,
@@ -570,8 +570,8 @@ def main():
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
     if args.actuation_mode == 'ik':
-        if not (0.0 < args.ik_max_displacement <= 0.015):
-            parser.error('--ik-max-displacement必须在(0, 0.015] m内；更大位移需先重新仿真验证')
+        if not (0.0 < args.ik_max_displacement <= 0.03):
+            parser.error('--ik-max-displacement必须在(0, 0.03] m内；更大位移需先重新仿真验证')
         if args.ik_force_gain <= 0.0 or args.ik_force_kp < 0.0 or args.ik_joint_delta_max <= 0.0:
             parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
     gravity_lower = args.m_object * 9.81 / max(2.0 * args.mu, 1e-6)

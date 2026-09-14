@@ -120,7 +120,7 @@ class SIFRController:
     '''
     def __init__(self, F_fixed=5.6, mu=0.4, m_object=0.45, K_f=0.002,
                  K_p=0.0, roll_offset_max=0.10, force_deadband=0.2,
-                 roll_offset_min=None, delta_min=0.0, delta_max=0.015,
+                 roll_offset_min=None, delta_min=0.0, delta_max=0.03,
                  delta_dot_max=0.02, slip_force_deadband=0.1):
         self.F_fixed = F_fixed
         self.mu = mu
@@ -443,8 +443,8 @@ def main():
     parser.add_argument('--urdf', type=str, default='description/g1_14dof_brainco_hand.urdf')
     args = parser.parse_args()
     if args.actuation_mode == 'ik':
-        if not (0.0 < args.ik_max_displacement <= 0.015):
-            parser.error('--ik-max-displacement必须在(0, 0.015] m内；更大位移需先重新仿真验证')
+        if not (0.0 < args.ik_max_displacement <= 0.03):
+            parser.error('--ik-max-displacement必须在(0, 0.03] m内；更大位移需先重新仿真验证')
         if args.ik_force_gain <= 0.0 or args.ik_force_kp < 0.0 or args.ik_joint_delta_max <= 0.0:
             parser.error('--ik-force-gain和--ik-joint-delta-max必须为正数')
     if (args.delta_max <= args.delta_min or args.delta_dot_max <= 0.0 or
